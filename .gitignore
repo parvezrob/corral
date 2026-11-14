@@ -1,0 +1,7 @@
+node_modules/
+# Herdr's generated API types, copied from the app home by `npm run types`.
+types/
+# Written by herdr-app into mod folders (and their subfolders); the repo's jsconfig.json is the one that counts.
+mods/**/gpui-kit.d.ts
+mods/**/jsconfig.json
+*.error

@@ -1,0 +1,25 @@
+{
+  "// why": [
+    "Type-checks the shared lib and every mod against the API types Herdr writes on each start",
+    "(copied into types/ by `npm run types`). Options follow Herdr's own jsconfig for mods:",
+    "no DOM lib (the runtime has none) and strictNullChecks off (views assign state in init)."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": [],
+    "checkJs": true,
+    "allowJs": true,
+    "strict": true,
+    "strictNullChecks": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "paths": {
+      "herdr": ["./types/herdr.d.ts"]
+    }
+  },
+  "include": ["types/gpui-kit.d.ts", "lib/**/*.js", "mods/*/*.js"],
+  "exclude": ["node_modules", "mods/*/lib"]
+}
