@@ -11,10 +11,17 @@ Files, source control, pull requests, ports and agent usage for the [Herdr app](
 | `corral-panel` | The right panel's tab strip: Files, Changes, PR, Ports |
 | `corral-files` | File tree of the space's folder on its machine, git marks, find by name or content |
 | `corral-git` | Changes: stage, unstage, discard, commit, pull, push; diffs open in the viewer |
+| `corral-pr` | The branch's pull request: checks (a failing one opens its log beside the terminal), reviews, threads to reply to, resolve or hand to your agent, merge; or a form to open one |
 | `corral-ports` | Dev servers on every machine; remote ones auto-forwarded to localhost over ssh |
 | `corral-view` | Viewer pane beside the terminal: code, rendered markdown, diffs; safe saving |
 | `corral-status` | Status bar: machine, branch, agents, live port forwards |
 | `corral` layout | Herdr's main layout with the panel and status bar |
+
+## Needs
+
+- [Herdr app](https://herdr.dev) 0.1.15 or newer
+- `git` on every machine with spaces; `gh` (signed in) there for the PR tab
+- Linux with `ss` on machines whose ports you want forwarded; plain `ssh` to reach them
 
 ## Develop
 

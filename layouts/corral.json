@@ -172,6 +172,13 @@
                       }
                     },
                     {
+                      "id": "pr",
+                      "type": "block",
+                      "content": {
+                        "mod": "corral-pr"
+                      }
+                    },
+                    {
                       "id": "ports",
                       "type": "block",
                       "content": {

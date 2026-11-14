@@ -33,6 +33,8 @@ export default class PanelTabs extends View {
         const spec = TABS[id] ?? { label: id, icon: "files" };
         const on = id === active;
         const count = this.badge(id);
+        const pr = id === "pr" ? /** @type {{ number: number, failing: number } | null} */ (shared("corral.pr")) : null;
+        const label = pr ? `PR #${pr.number}` : spec.label;
         return h_flex().id(`corral-tab-${id}`).h_full().px(9).gap(6).items_center().flex_none().cursor_pointer()
           .border_b(2).border_color(on ? t.accent : CLEAR)
           .text_color(on ? t.foreground : t.muted).when(on, (el) => el.font_medium())
@@ -40,7 +42,8 @@ export default class PanelTabs extends View {
           .on_mouse_down("left", stop)
           .on_click(() => openPanel(id))
           .child(svg(`mods/corral-panel/${spec.icon}.svg`).size(14))
-          .child(spec.label)
+          .child(label)
+          .when(Boolean(pr?.failing), (el) => el.child(div().size(6).rounded(3).bg(t.ansi1)))
           .when(count > 0, (el) => el.child(div().px(5).rounded(7).bg(t.raised).text_size(11).text_color(t.foreground).child(String(count))));
       }))
       .child(div().flex_1())

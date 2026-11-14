@@ -17,9 +17,10 @@ const VIEWS_KEY = "corral.views";
  * @property {string} path            absolute, on `machine`
  * @property {string | null} machine  null: this computer
  * @property {string | null} root     the repo or folder it belongs to (for git and short paths)
- * @property {"file" | "diff"} mode
+ * @property {"file" | "diff" | "log"} mode
  * @property {"staged" | "unstaged" | "untracked" | "head"} [diff]  which change a diff shows
  * @property {number} [seq]           newer requests win
+ * @property {{ host: string, repo: string, job: string, run: string, check: string, pr: number }} [log]  a CI job (mode "log"); `path` is its URL
  */
 
 /** @param {string} viewId */
