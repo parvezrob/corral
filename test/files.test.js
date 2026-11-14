@@ -9,7 +9,7 @@ import { score, rank, FILES_SCRIPT, CONTENT_SCRIPT, parseContentHits } from "../
 
 /** A small repo: src/app.ts (changed), src/util/, notes.md (new), .hidden, a link to a folder. */
 function fixture() {
-  const dir = mkdtempSync(join(tmpdir(), "wb-files-"));
+  const dir = mkdtempSync(join(tmpdir(), "corral-files-"));
   const git = (...args) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", ...args], { encoding: "utf8" });
   git("init", "-q", "-b", "main");
   mkdirSync(join(dir, "src", "util"), { recursive: true });
@@ -31,7 +31,7 @@ test("one listing call: folders, entries and git marks", (t) => {
   try { execFileSync("git", ["--version"]); } catch { t.skip("git not installed"); return; }
   const dir = fixture();
   try {
-    const out = execFileSync("sh", ["-c", LIST_SCRIPT, "wb", dir, "", "src"], { encoding: "utf8" });
+    const out = execFileSync("sh", ["-c", LIST_SCRIPT, "corral", dir, "", "src"], { encoding: "utf8" });
     const l = parseListing(out);
     assert.equal(l.git, true);
     assert.equal(l.branch?.head, "main");
@@ -50,10 +50,10 @@ test("one listing call: folders, entries and git marks", (t) => {
 });
 
 test("a folder that isn't a repo lists without marks", () => {
-  const dir = mkdtempSync(join(tmpdir(), "wb-plain-"));
+  const dir = mkdtempSync(join(tmpdir(), "corral-plain-"));
   try {
     writeFileSync(join(dir, "a b.txt"), "");
-    const l = parseListing(execFileSync("sh", ["-c", LIST_SCRIPT, "wb", dir, ""], { encoding: "utf8" }));
+    const l = parseListing(execFileSync("sh", ["-c", LIST_SCRIPT, "corral", dir, ""], { encoding: "utf8" }));
     assert.equal(l.git, false);
     assert.deepEqual(l.folders.get("")?.map((e) => e.name), ["a b.txt"]);
   } finally {
@@ -77,11 +77,11 @@ test("file list and content search scripts", (t) => {
   try { execFileSync("git", ["--version"]); } catch { t.skip("git not installed"); return; }
   const dir = fixture();
   try {
-    const files = execFileSync("sh", ["-c", FILES_SCRIPT, "wb", dir], { encoding: "utf8" }).split("\0").filter(Boolean).sort();
+    const files = execFileSync("sh", ["-c", FILES_SCRIPT, "corral", dir], { encoding: "utf8" }).split("\0").filter(Boolean).sort();
     assert.ok(files.includes("src/util/strings.ts"));
     assert.ok(files.includes("notes.md"), "untracked files are listed");
     assert.ok(!files.includes("ignored.log"), "ignored files are not");
-    const hits = parseContentHits(execFileSync("sh", ["-c", CONTENT_SCRIPT, "wb", dir, "needle"], { encoding: "utf8" }));
+    const hits = parseContentHits(execFileSync("sh", ["-c", CONTENT_SCRIPT, "corral", dir, "needle"], { encoding: "utf8" }));
     assert.deepEqual(hits.map((h) => `${h.path}:${h.line}`).sort(), ["notes.md:1", "src/util/strings.ts:1"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });

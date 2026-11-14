@@ -1,5 +1,5 @@
 {
-  "name": "herdr-workbench",
+  "name": "corral",
   "version": "0.1.0",
   "private": true,
   "description": "Files, source control, pull requests, ports and agent usage for the Herdr app.",

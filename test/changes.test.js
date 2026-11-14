@@ -10,7 +10,7 @@ const user = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"];
 
 test("one call: groups, line counts, commits and what isn't pushed", (t) => {
   try { execFileSync("git", ["--version"]); } catch { t.skip("git not installed"); return; }
-  const base = mkdtempSync(join(tmpdir(), "wb-changes-"));
+  const base = mkdtempSync(join(tmpdir(), "corral-changes-"));
   const remote = join(base, "remote.git"), dir = join(base, "work");
   const git = (/** @type {string[]} */ ...args) => execFileSync("git", ["-C", dir, ...user, ...args], { encoding: "utf8" });
   try {
@@ -26,7 +26,7 @@ test("one call: groups, line counts, commits and what isn't pushed", (t) => {
     writeFileSync(join(dir, "b.txt"), "z\n");               // and unstaged on top
     writeFileSync(join(dir, "new file.md"), "# n\n");       // untracked
 
-    const c = parseChanges(execFileSync("sh", ["-c", CHANGES_SCRIPT, "wb", dir], { encoding: "utf8" }));
+    const c = parseChanges(execFileSync("sh", ["-c", CHANGES_SCRIPT, "corral", dir], { encoding: "utf8" }));
     assert.equal(c.branch.head, "main");
     assert.equal(c.branch.upstream, "origin/main");
     assert.equal(c.branch.ahead, 1);
@@ -43,9 +43,9 @@ test("one call: groups, line counts, commits and what isn't pushed", (t) => {
 });
 
 test("not a repo exits 3", () => {
-  const dir = mkdtempSync(join(tmpdir(), "wb-norepo-"));
+  const dir = mkdtempSync(join(tmpdir(), "corral-norepo-"));
   try {
-    assert.throws(() => execFileSync("sh", ["-c", CHANGES_SCRIPT, "wb", dir], { stdio: "pipe" }), (e) => /** @type {any} */ (e).status === 3);
+    assert.throws(() => execFileSync("sh", ["-c", CHANGES_SCRIPT, "corral", dir], { stdio: "pipe" }), (e) => /** @type {any} */ (e).status === 3);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

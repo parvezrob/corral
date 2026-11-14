@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const mods = (await readdir(join(root, "mods"), { withFileTypes: true }))
-  .filter((d) => d.isDirectory() && d.name.startsWith("wb-"))
+  .filter((d) => d.isDirectory() && d.name.startsWith("corral-"))
   .map((d) => d.name)
   .sort();
 

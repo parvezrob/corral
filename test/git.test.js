@@ -61,7 +61,7 @@ test("numstat: counts, binaries and renames keyed by the new path", () => {
 
 test("matches real git output", (t) => {
   try { execFileSync("git", ["--version"]); } catch { t.skip("git not installed"); return; }
-  const dir = mkdtempSync(join(tmpdir(), "wb-git-"));
+  const dir = mkdtempSync(join(tmpdir(), "corral-git-"));
   const git = (...args) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", ...args], { encoding: "utf8" });
   try {
     git("init", "-q", "-b", "main");

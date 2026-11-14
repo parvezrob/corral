@@ -1,7 +1,7 @@
 // Links this repo's mods and layouts into the Herdr app home, so the app runs
 // them straight from here. Never replaces anything that isn't already our link.
 //
-//   node scripts/link.mjs           link mods/wb-* and layouts/*.json
+//   node scripts/link.mjs           link mods/corral-* and layouts/*.json
 //   node scripts/link.mjs --remove  remove those links again
 import { readdir, lstat, readlink, symlink, unlink, mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -13,7 +13,7 @@ const appHome = process.env.HERDR_APP_HOME || join(homedir(), ".config", "herdr-
 const remove = process.argv.includes("--remove");
 
 const mods = (await readdir(join(root, "mods"), { withFileTypes: true }))
-  .filter((d) => d.isDirectory() && d.name.startsWith("wb-"))
+  .filter((d) => d.isDirectory() && d.name.startsWith("corral-"))
   .map((d) => [join(root, "mods", d.name), join(appHome, "mods", d.name)]);
 const layouts = (await readdir(join(root, "layouts")))
   .filter((f) => f.endsWith(".json") || f.endsWith(".svg"))

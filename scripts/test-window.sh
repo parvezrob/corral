@@ -8,12 +8,12 @@
 #   HERDR_APP_HOME=~/.cache/wbt herdr-app shot out.png     see it
 #
 # Mouse and keyboard can't be faked into it (no input devices on Xvfb), so drive
-# it with commands: layout.select, space.select, wb-files.open:<path>,
-# wb-git.diff:<path>. Needs: sudo apt install xvfb.
+# it with commands: layout.select, space.select, corral-files.open:<path>,
+# corral-git.diff:<path>. Needs: sudo apt install xvfb.
 set -eu
 home=${HERDR_TEST_HOME:-$HOME/.cache/wbt}   # short: the control socket path has a length limit
 mkdir -p "$home"
-[ -f "$home/shared.json" ] || printf '{"frame.welcomed":"finished","layout":"workbench"}\n' > "$home/shared.json"
+[ -f "$home/shared.json" ] || printf '{"frame.welcomed":"finished","layout":"corral"}\n' > "$home/shared.json"
 [ -f "$home/settings.json" ] || printf '{"zoom":1.0,"telemetry":false,"sounds":{"enabled":false}}\n' > "$home/settings.json"
 cd "$(dirname "$0")/.."
 HERDR_APP_HOME=$home node scripts/link.mjs

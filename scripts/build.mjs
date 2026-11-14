@@ -1,4 +1,4 @@
-// Copies the shared lib/ into every mod folder (mods/wb-*/lib/).
+// Copies the shared lib/ into every mod folder (mods/corral-*/lib/).
 //
 // Herdr resolves a mod's imports only inside its own folder (a symlink pointing out
 // is refused too), and a mod published to herdr.dev must stand alone. So each mod
@@ -16,7 +16,7 @@ const banner = (file) => `// Generated from lib/${file} by scripts/build.mjs. Ed
 
 const sources = (await readdir(join(root, "lib"))).filter((f) => f.endsWith(".js")).sort();
 const mods = (await readdir(join(root, "mods"), { withFileTypes: true }))
-  .filter((d) => d.isDirectory() && d.name.startsWith("wb-"))
+  .filter((d) => d.isDirectory() && d.name.startsWith("corral-"))
   .map((d) => d.name)
   .sort();
 
