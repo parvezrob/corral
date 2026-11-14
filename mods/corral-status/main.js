@@ -2,11 +2,15 @@
 // forwards, and the command palette hint. Herdr's own status facts, plus ours.
 import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, agents, terminals, run, window, keys, nextCommand, shared } from "herdr";
+import { spaces, agents, terminals, run, window, keys, nextCommand, shared, setShared, openOverlay } from "herdr";
 import { colors } from "./lib/theme.js";
 import { forwardsFrom } from "./lib/forward.js";
 import { openPanel } from "./lib/panel.js";
-import { openUrl } from "./lib/host.js";
+import { openUrl, sh } from "./lib/host.js";
+import { here } from "./lib/context.js";
+import { USAGE_SCRIPT, USER_AGENT, parseUsage, chipText, worst, level } from "./lib/usage.js";
+
+const USAGE_EVERY_MS = 5 * 60e3;
 
 /** The palette key as actually bound, so the hint never lies. */
 function paletteHint() {
@@ -42,9 +46,15 @@ export default class Status extends View {
 
   /** The status bar is always on screen, so mod commands sent from toasts land here. @param {any} _props @param {any} cx */
   init(_props, cx) {
-    cx.spawn(async () => {
+    /** @type {Map<string, { at: number, data: import("./lib/usage.js").Usage }>} usage by machine ("" = this computer) */
+    this.usage = new Map();
+    /** @type {string | null} */ this.fetching = null;
+    cx.timer.every(15000, (/** @type {any} */ cx) => this.usageTick(cx, false));
+    this.usageTick(cx, false);
+    cx.spawn(async (/** @type {any} */ cx) => {
       for (;;) {
         const command = await nextCommand();
+        if (command === "usage-refresh") { this.usageTick(cx, true); continue; }
         const port = /^open-(\d+)$/.exec(command);
         if (port) openUrl(`http://localhost:${port[1]}`);
         else if (command.startsWith("panel-")) openPanel(command.slice(6));
@@ -52,8 +62,57 @@ export default class Status extends View {
     });
   }
 
+  /**
+   * Usage for the machine your agents are on (the shown space's), every few
+   * minutes or on demand. Shared so the popover can draw it.
+   * @param {any} cx @param {boolean} force
+   */
+  usageTick(cx, force) {
+    const machine = here().machine;
+    const key = machine ?? "";
+    const have = this.usage.get(key);
+    const published = /** @type {{ machine: string | null } | null} */ (shared("corral.usage"));
+    if (have && (published?.machine ?? null) !== machine) this.publishUsage(machine, have.at, have.data, false);
+    if (this.fetching !== null || (!force && have && Date.now() - have.at < USAGE_EVERY_MS)) return;
+    this.fetching = key;
+    if (have) this.publishUsage(machine, have.at, have.data, true);
+    cx.spawn(async (/** @type {any} */ cx) => {
+      try {
+        const r = await sh(machine, USAGE_SCRIPT, [USER_AGENT], { timeout: 40000 });
+        const data = parseUsage(r.stdout);
+        const at = Date.now();
+        this.usage.set(key, { at, data });
+        if ((here().machine ?? "") === key) this.publishUsage(machine, at, data, false);
+      } catch {
+        // Unreachable machine: keep what we had; the next tick tries again.
+        if (have) this.publishUsage(machine, have.at, have.data, false);
+      } finally {
+        this.fetching = null;
+        cx.notify();
+      }
+    });
+  }
+
+  /** @param {string | null} machine @param {number} at @param {import("./lib/usage.js").Usage} data @param {boolean} fetching */
+  publishUsage(machine, at, data, fetching) {
+    setShared("corral.usage", { machine, at, claude: data.claude, codex: data.codex, fetching });
+  }
+
+  /** "Claude 42% wk", coloured as it fills up. @param {Record<string, any>} t @param {import("./lib/usage.js").Provider} p */
+  usageChip(t, p) {
+    const w = worst(p);
+    const lv = w ? level(w.percent) : "normal";
+    return h_flex().id(`corral-status-${p.id}`).gap(5).items_center().cursor_pointer().hover((s) => s.text_color(t.foreground))
+      .on_click(() => openOverlay({ mod: "corral-usage", kind: "popup", width: 360 }))
+      .child(div().text_color(t.foreground).child(p.name))
+      .child(div().text_color(lv === "high" ? t.ansi1 : lv === "warn" ? t.blocked : t.muted).child(w ? chipText(p) : "?"));
+  }
+
   render() {
     const t = colors();
+    const usage = /** @type {{ claude: import("./lib/usage.js").Provider, codex: import("./lib/usage.js").Provider } | null} */ (shared("corral.usage"));
+    // A provider gets a chip once it has numbers, or a problem worth a look (not "not installed").
+    const chips = usage ? [usage.claude, usage.codex].filter((p) => p.limits.length || (p.error && !/isn't installed|Not signed in/.test(p.error))) : [];
     const space = spaces().find((s) => s.active);
     const list = agents();
     const needs = list.filter((a) => a.status === "blocked").length;
@@ -68,6 +127,7 @@ export default class Status extends View {
       .child(h_flex().gap(6).items_center().child(div().size(6).rounded(3).bg(t.dim)).child(`${list.length} agents`)
         .when(needs > 0, (el) => el.child(div().text_color(t.blocked).child(`· ${needs} needs you`))))
       .child(div().flex_1())
+      .children(chips.map((p) => this.usageChip(t, p)))
       .when(forwards > 0, (el) => el.child(h_flex().id("corral-status-ports").gap(6).items_center().cursor_pointer().text_color(t.foreground)
         .hover((s) => s.text_color(t.accent))
         .on_click(() => openPanel("ports"))

@@ -209,5 +209,6 @@
         }
       ]
     }
-  ]
+  ],
+  "preview": "layouts/corral.svg"
 }
