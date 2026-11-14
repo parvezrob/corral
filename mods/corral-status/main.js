@@ -2,13 +2,15 @@
 // forwards, and the command palette hint. Herdr's own status facts, plus ours.
 import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, agents, terminals, run, window, keys, nextCommand, shared, setShared, openOverlay } from "herdr";
+import { spaces, agents, terminals, run, window, keys, nextCommand, shared, setShared, openOverlay, closeOverlay } from "herdr";
 import { colors } from "./lib/theme.js";
 import { forwardsFrom } from "./lib/forward.js";
 import { openPanel } from "./lib/panel.js";
 import { openUrl, sh } from "./lib/host.js";
 import { here } from "./lib/context.js";
-import { USAGE_SCRIPT, USER_AGENT, parseUsage, chipText, worst, level } from "./lib/usage.js";
+import { USAGE_SCRIPT, USER_AGENT, parseUsage, chipText, worst, level, shownProviders, popoverHeight } from "./lib/usage.js";
+
+const POPOVER_WIDTH = 360;
 
 const USAGE_EVERY_MS = 5 * 60e3;
 
@@ -49,12 +51,19 @@ export default class Status extends View {
     /** @type {Map<string, { at: number, data: import("./lib/usage.js").Usage }>} usage by machine ("" = this computer) */
     this.usage = new Map();
     /** @type {string | null} */ this.fetching = null;
+    /** @type {{ x: number, y: number, width: number, height: number } | null} the chip last pressed */ this.chip = null;
+    /** @type {string | null} */ this.popover = null;
     cx.timer.every(15000, (/** @type {any} */ cx) => this.usageTick(cx, false));
     this.usageTick(cx, false);
     cx.spawn(async (/** @type {any} */ cx) => {
       for (;;) {
         const command = await nextCommand();
         if (command === "usage-refresh") { this.usageTick(cx, true); continue; }
+        if (command === "usage-reopen") { this.openUsage(true); continue; }
+        if (command.startsWith("usage-closed:")) { if (command.slice(13) === this.popover) this.popover = null; continue; }
+        // "usage-at:x,y,w,h" opens it above a box at those window coordinates (scripts, tests).
+        const box = /^usage-at:([\d.]+),([\d.]+),([\d.]+),([\d.]+)$/.exec(command);
+        if (box) { this.chip = { x: +box[1], y: +box[2], width: +box[3], height: +box[4] }; this.openUsage(false); continue; }
         const port = /^open-(\d+)$/.exec(command);
         if (port) openUrl(`http://localhost:${port[1]}`);
         else if (command.startsWith("panel-")) openPanel(command.slice(6));
@@ -98,12 +107,34 @@ export default class Status extends View {
     setShared("corral.usage", { machine, at, claude: data.claude, codex: data.codex, fetching });
   }
 
+  /**
+   * The usage popover, right above the chip that was pressed, its right edge on
+   * the chip's, at the height its content needs.
+   * @param {boolean} reopen  replace the open one (its view changed)
+   * @returns {void}
+   */
+  openUsage(reopen) {
+    const open = this.popover;
+    if (open) { closeOverlay(open); this.popover = null; }
+    // A second click on a chip closes it; a reopen needs one open.
+    if (open ? !reopen : reopen) return;
+    const height = popoverHeight(/** @type {any} */ (shared("corral.usage")), shared("corral.usage.mode") === "compact");
+    const b = this.chip;
+    const at = b ? { x: Math.max(8, Math.round(b.x + b.width - POPOVER_WIDTH)), y: Math.max(8, Math.round(b.y - height - 6)) } : "pointer";
+    this.popover = openOverlay({ mod: "corral-usage", kind: "popup", width: POPOVER_WIDTH, height, at });
+  }
+
   /** "Claude 42% wk", coloured as it fills up. @param {Record<string, any>} t @param {import("./lib/usage.js").Provider} p */
   usageChip(t, p) {
     const w = worst(p);
     const lv = w ? level(w.percent) : "normal";
     return h_flex().id(`corral-status-${p.id}`).gap(5).items_center().cursor_pointer().hover((s) => s.text_color(t.foreground))
-      .on_click(() => openOverlay({ mod: "corral-usage", kind: "popup", width: 360 }))
+      .on_mouse_down("left", (/** @type {any} */ e) => {
+        // The chip's box in the window: where the press was, minus where in the chip it was.
+        const local = e.local_position ?? { x: 0, y: 0 };
+        this.chip = { x: e.position.x - local.x, y: e.position.y - local.y, width: e.bounds?.width ?? 0, height: e.bounds?.height ?? 0 };
+      })
+      .on_click(() => this.openUsage(false))
       .child(div().text_color(t.foreground).child(p.name))
       .child(div().text_color(lv === "high" ? t.ansi1 : lv === "warn" ? t.blocked : t.muted).child(w ? chipText(p) : "?"));
   }
@@ -112,7 +143,7 @@ export default class Status extends View {
     const t = colors();
     const usage = /** @type {{ claude: import("./lib/usage.js").Provider, codex: import("./lib/usage.js").Provider } | null} */ (shared("corral.usage"));
     // A provider gets a chip once it has numbers, or a problem worth a look (not "not installed").
-    const chips = usage ? [usage.claude, usage.codex].filter((p) => p.limits.length || (p.error && !/isn't installed|Not signed in/.test(p.error))) : [];
+    const chips = shownProviders(usage).filter((p) => p.limits.length || !/Not signed in/.test(p.error ?? ""));
     const space = spaces().find((s) => s.active);
     const list = agents();
     const needs = list.filter((a) => a.status === "blocked").length;

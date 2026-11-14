@@ -3,9 +3,9 @@
 // what it shared ("corral.usage"), detailed or compact.
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { shared, setShared, run, nextCommand } from "herdr";
+import { shared, setShared, run, nextCommand, props } from "herdr";
 import { colors, alpha } from "./lib/theme.js";
-import { pace, until, level } from "./lib/usage.js";
+import { pace, until, level, shownProviders } from "./lib/usage.js";
 
 /** @typedef {import("./lib/usage.js").Provider} Provider */
 /** @typedef {import("./lib/usage.js").Limit} Limit */
@@ -22,30 +22,42 @@ export default class UsagePopover extends View {
     cx.spawn(async () => {
       for (;;) {
         const command = await nextCommand();
-        if (command === "compact" || command === "detailed") setShared("corral.usage.mode", command);
+        if (command === "compact" || command === "detailed") this.setMode(command);
       }
     });
   }
 
+  /** However it was closed (Esc, a click beside it, the chip), the status bar should know. */
+  async close() {
+    run(`corral-status.usage-closed:${props()?.overlay ?? ""}`);
+  }
+
   get compact() { return shared("corral.usage.mode") === "compact"; }
+
+  /** The other view has another height: the status bar reopens it, sized, in the same spot. @param {"compact" | "detailed"} mode */
+  setMode(mode) {
+    if ((mode === "compact") === this.compact) return;
+    setShared("corral.usage.mode", mode);
+    run("corral-status.usage-reopen");
+  }
 
   /** @param {any} _cx */
   render(_cx) {
     const t = colors();
     const u = /** @type {Shared} */ (shared("corral.usage"));
-    const providers = u ? [u.claude, u.codex].filter((p) => p.limits.length || (p.error && !/isn't installed/.test(p.error))) : [];
+    const providers = shownProviders(u);
     const ago = u ? until(Date.now() + (Date.now() - u.at)) : "";
     /** @param {string} id @param {string} label @param {boolean} on @param {() => void} click */
     const seg = (id, label, on, click) => div().id(id).h(22).px(9).flex().items_center().rounded(6).cursor_pointer()
       .bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted).on_click(click).child(label);
-    return v_flex().id("corral-usage").w_full().p(14).gap(12).text_size(12.5).text_color(t.foreground)
+    return v_flex().id("corral-usage").size_full().overflow_y_scrollbar().p(14).gap(12).text_size(12.5).text_color(t.foreground)
       .child(h_flex().gap(8).items_center()
         .child(div().text_size(13.5).font_semibold().child("Usage"))
         .child(div().text_size(11.5).text_color(t.dim).child(!u ? "" : u.fetching ? "Updating…" : `Updated ${ago === "1m" && Date.now() - u.at < 60e3 ? "just now" : `${ago} ago`}`))
         .child(div().flex_1())
         .child(h_flex().p(2).gap(2).rounded(8).border_1().border_color(t.border).text_size(11.5)
-          .child(seg("corral-usage-detailed", "Detailed", !this.compact, () => setShared("corral.usage.mode", "detailed")))
-          .child(seg("corral-usage-compact", "Compact", this.compact, () => setShared("corral.usage.mode", "compact"))))
+          .child(seg("corral-usage-detailed", "Detailed", !this.compact, () => this.setMode("detailed")))
+          .child(seg("corral-usage-compact", "Compact", this.compact, () => this.setMode("compact"))))
         .child(div().id("corral-usage-refresh").size(24).flex().items_center().justify_center().rounded(6).cursor_pointer().text_color(t.dim)
           .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(() => run("corral-status.usage-refresh")).child("↻")))
       .when(!u, (el) => el.child(div().text_color(t.dim).child("Reading your limits…")))

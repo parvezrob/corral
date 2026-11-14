@@ -56,7 +56,9 @@ yours; nothing here changes your repos unless the step says so.
 ## 5. Usage
 
 - [ ] Status bar shows `Claude 42% wk  Codex 33% wk` (your numbers), read on robin-pc.
-- [ ] Click a chip: the popover, Detailed and Compact, ↻ refreshes, "Updated … ago".
+- [ ] Click a chip: the popover opens right above it, its right edge on the chip's, sized to fit.
+- [ ] Detailed ↔ Compact reopens it at the new size in the same spot; ↻ refreshes; "Updated … ago".
+- [ ] A second click on the chip closes it; after Esc, one click opens it again.
 - [ ] Compare with `claude /usage` and Codex's `/status`.
 
 ## 6. Status bar and panel

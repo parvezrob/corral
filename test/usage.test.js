@@ -124,3 +124,15 @@ test("an expired login isn't sent anywhere", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("popover height follows what it shows", async () => {
+  const { popoverHeight, shownProviders } = await import("../lib/usage.js");
+  const claude = parseClaude(`max\x1f${JSON.stringify({ limits: CLAUDE.limits.slice(0, 2), spend: CLAUDE.spend })}\n200`);
+  const codex = parseCodex(JSON.stringify({ id: 2, result: { rateLimits: { primary: { usedPercent: 33, windowDurationMins: 10080, resetsAt: 1795228292 }, credits: { hasCredits: true, balance: "2102.4" } }, rateLimitResetCredits: { availableCount: 1 } } }));
+  // Measured from the drawn popover: 462 px detailed, about 176 compact.
+  assert.equal(popoverHeight({ claude, codex }, false), 466);
+  assert.equal(popoverHeight({ claude, codex }, true), 180);
+  const missing = parseCodex("!missing");
+  assert.deepEqual(shownProviders({ claude, codex: missing }).map((p) => p.id), ["claude"]);
+  assert.equal(popoverHeight(null, false), 126);
+});
