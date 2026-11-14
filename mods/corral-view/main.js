@@ -8,6 +8,7 @@ import { colors, alpha, CLEAR } from "./lib/theme.js";
 import { readFile, writeFile, run, sh, openUrl, StaleFileError } from "./lib/host.js";
 import { JOB_LOG_SCRIPT, SAVE_LOG_SCRIPT, parseJobLog, GH, failurePrompt } from "./lib/pr.js";
 import { handOff, sendLabel } from "./lib/handoff.js";
+import { Review } from "./review.js";
 import { languageFor, languageForFence, isMarkdown, syntaxColors } from "./lib/lang.js";
 import { splitMarkdown } from "./lib/markdown.js";
 import { parseDiff, addedFileRows, widestRow } from "./lib/diff.js";
@@ -30,6 +31,8 @@ export default class Viewer extends View {
     this.viewId = p?.viewId ?? null;
     /** @type {ViewRequest | null} */ this.req = null;
     this.seq = -1;
+    /** @type {number | null} */ this.scheduled = null;
+    this.review = new Review();
     this.reset();
     this.handle = cx.focus_handle();
     if (p?.path) this.load(p, cx);
@@ -45,6 +48,7 @@ export default class Viewer extends View {
 
   reset() {
     this.releaseStates();
+    this.review?.reset();
     this.loading = false;
     /** @type {string | null} */ this.error = null;
     /** @type {string | null} */ this.original = null;
@@ -56,7 +60,7 @@ export default class Viewer extends View {
     this.dirty = false;
     this.saving = false;
     this.conflict = false;
-    /** @type {"rendered" | "source" | "diff" | "log"} */ this.view = "source";
+    /** @type {"rendered" | "source" | "diff" | "log" | "review"} */ this.view = "source";
     /** @type {import("./lib/pr.js").JobLog | null} */ this.log = null;
     /** @type {"failed" | "all"} */ this.logScope = "failed";
     this.logWidth = 0;
@@ -76,6 +80,7 @@ export default class Viewer extends View {
 
   async close() {
     this.releaseStates();
+    this.review.release();
     for (const s of this.retired) s.release();
     this.retired = [];
     if (this.viewId) setShared(requestKey(this.viewId), null);
@@ -94,6 +99,7 @@ export default class Viewer extends View {
       try {
         if (req.mode === "diff") await this.loadDiff(req);
         else if (req.mode === "log") await this.loadLog(req);
+        else if (req.mode === "prdiff") { this.view = "review"; await this.review.load(req, () => seq === this.seq); }
         else await this.loadFile(req, keepView);
       } catch (e) {
         if (seq === this.seq) this.error = e instanceof Error ? e.message : String(e);
@@ -105,7 +111,7 @@ export default class Viewer extends View {
     cx.notify();
   }
 
-  /** @param {ViewRequest} req @param {"rendered" | "source" | "diff" | "log" | null} keepView */
+  /** @param {ViewRequest} req @param {"rendered" | "source" | "diff" | "log" | "review" | null} keepView */
   async loadFile(req, keepView) {
     const seq = this.seq;
     const text = await readFile(req.machine, req.path);
@@ -271,7 +277,11 @@ export default class Viewer extends View {
   /** @param {any} cx */
   render(cx) {
     const pending = /** @type {ViewRequest | null} */ (this.viewId ? shared(requestKey(this.viewId)) : null);
-    if (pending && (pending.seq ?? 0) > this.seq) this.load(pending, cx);
+    // A newer request from a panel: load it just after this frame (render may not notify).
+    if (pending && (pending.seq ?? 0) > this.seq && pending.seq !== this.scheduled) {
+      this.scheduled = pending.seq ?? null;
+      cx.timer.after(0, (/** @type {any} */ cx) => { this.scheduled = null; if ((pending.seq ?? 0) > this.seq) this.load(pending, cx); });
+    }
     if (this.retired.length) {
       const old = this.retired;
       this.retired = [];
@@ -293,6 +303,10 @@ export default class Viewer extends View {
   header(t, cx) {
     const req = this.req;
     if (req?.mode === "log") return this.logHeader(t, cx);
+    if (req?.mode === "prdiff" && req.review) {
+      const r = req.review, base = req;
+      return this.review.header(t, cx, req, (file) => this.load({ ...base, path: join(base.root ?? "", file), review: { ...r, file }, seq: Date.now() }, cx), MONO());
+    }
     const shown = req ? (req.root && relative(req.root, req.path)) || req.path : "";
     const dir = shown.includes("/") ? shown.slice(0, shown.lastIndexOf("/") + 1) : "";
     const md = Boolean(req && req.mode === "file" && isMarkdown(req.path) && this.source);
@@ -336,8 +350,9 @@ export default class Viewer extends View {
   body(t, cx) {
     if (!this.req) return div().flex_1().p(16).text_color(t.dim).child("Open a file from Files or Changes.");
     if (this.error) return div().flex_1().p(16).text_color(t.muted).child(this.error);
-    if (this.loading) return div().flex_1().p(16).text_color(t.dim).child(this.req.mode === "log" ? "Fetching the job's log from GitHub…" : "Loading…");
+    if (this.loading) return div().flex_1().p(16).text_color(t.dim).child(this.req.mode === "log" ? "Fetching the job's log from GitHub…" : this.req.mode === "prdiff" ? "Fetching the pull request's diff…" : "Loading…");
     if (this.view === "log") return this.logBody(t);
+    if (this.view === "review") return this.review.body(t, cx, this.req, MONO(), /** @type {string} */ (settings().ui_font_family) || "Geist");
     if (this.view === "diff") return this.diffBody(t);
     if (this.view === "rendered") return this.markdownBody(t, cx);
     return this.source ? Editor.new(this.source).flex_1().min_h(0) : div().flex_1();

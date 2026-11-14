@@ -12,6 +12,7 @@ import { sh, run, openUrl } from "./lib/host.js";
 import { panelState } from "./lib/layout.js";
 import { join } from "./lib/paths.js";
 import { openView } from "./lib/open.js";
+import { changeLetter } from "./lib/review.js";
 import { handOff, sendLabel } from "./lib/handoff.js";
 import {
   PR_SCRIPT, THREADS_QUERY, SAVE_LOG_SCRIPT, parsePrState, summarizeChecks, prSteps, blockers, canMergeNow,
@@ -45,7 +46,7 @@ export default class PullRequestPanel extends View {
     this.loading = false;
     this.again = false;
     this.lastRefresh = 0;
-    /** @type {"overview" | "threads"} */ this.tab = "overview";
+    /** @type {"overview" | "threads" | "files"} */ this.tab = "overview";
     /** @type {MergeMethod | null} */ this.method = null;
     /** @type {Record<string, number>} */ this.armed = {};
     /** @type {Set<string>} */ this.openResolved = new Set();
@@ -66,7 +67,8 @@ export default class PullRequestPanel extends View {
       for (;;) {
         const command = await nextCommand();
         if (command === "refresh") this.refresh(cx);
-        else if (command === "threads" || command === "overview") this.tab = command;
+        else if (command === "threads" || command === "overview" || command === "files") this.tab = command;
+        else if (command.startsWith("review:")) this.openReview(command.slice(7));
         else if (command === "show-resolved") { this.tab = "threads"; for (const x of this.pr?.threads ?? []) if (x.resolved) this.openResolved.add(x.id); }
         else if (command.startsWith("log:")) { const c = this.pr?.checks[Number(command.slice(4))]; if (c) this.openLog(c); }
         cx.notify();
@@ -354,9 +356,25 @@ export default class PullRequestPanel extends View {
     });
   }
 
-  /** @param {Thread} t */
-  openThreadFile(t) {
-    if (this.root) openView({ path: join(this.root, t.path), machine: this.machine, root: this.root, mode: "file" });
+  /** A file of the PR as its PR diff, with its threads, beside the terminal. @param {string} file */
+  openReview(file) {
+    const pr = this.pr;
+    if (!pr || !this.root) return;
+    const files = pr.fileList.map((f) => f.path);
+    openView({
+      path: join(this.root, file), machine: this.machine, root: this.root, mode: "prdiff",
+      review: { number: pr.number, host: pr.host, repo: pr.repo, id: pr.id, head: pr.head, headSha: pr.headSha, url: pr.url, file, files: files.includes(file) ? files : [...files, file] },
+    });
+  }
+
+  /** @param {string} path @param {any} cx */
+  toggleViewed(path, cx) {
+    const pr = this.pr;
+    const f = pr?.fileList.find((x) => x.path === path);
+    if (!pr || !f || !pr.id) return;
+    f.viewed = !f.viewed;
+    cx.notify();
+    cx.spawn(async (/** @type {any} */ cx) => { if (!(await this.gh("Saving…", GH.viewed(pr.host, pr.id, path, f.viewed), cx))) f.viewed = !f.viewed; });
   }
 
   // ---- Render -------------------------------------------------------------
@@ -374,10 +392,11 @@ export default class PullRequestPanel extends View {
       .child(this.header(t, pr))
       .child(h_flex().flex_none().px(10).gap(4).border_b(1).border_color(t.border).text_size(12.5)
         .child(this.subTab(t, "overview", "Overview", cx))
-        .child(this.subTab(t, "threads", open ? `Threads · ${open}` : "Threads", cx)))
+        .child(this.subTab(t, "threads", open ? `Threads · ${open}` : "Threads", cx))
+        .child(this.subTab(t, "files", `Files · ${pr.fileCount}`, cx)))
       .when(Boolean(this.note), (el) => el.child(this.noteBar(t, cx)))
       .child(v_flex().id("corral-pr-body").flex_1().min_h(0).overflow_y_scrollbar().px(12).pb(14)
-        .child(this.tab === "threads" ? this.threads(t, pr, cx) : this.overview(t, pr, cx)));
+        .child(this.tab === "threads" ? this.threads(t, pr, cx) : this.tab === "files" ? this.files(t, pr, cx) : this.overview(t, pr, cx)));
   }
 
   /** @param {Record<string, any>} t @param {string} text @param {any} cx */
@@ -395,7 +414,7 @@ export default class PullRequestPanel extends View {
       .child(div().id("corral-pr-note-x").flex_none().text_color(t.dim).cursor_pointer().on_click(() => { this.note = null; cx.notify(); }).child("✕"));
   }
 
-  /** @param {Record<string, any>} t @param {"overview" | "threads"} id @param {string} label @param {any} cx */
+  /** @param {Record<string, any>} t @param {"overview" | "threads" | "files"} id @param {string} label @param {any} cx */
   subTab(t, id, label, cx) {
     const on = this.tab === id;
     return div().id(`corral-pr-tab-${id}`).h(32).px(8).flex().items_center().cursor_pointer()
@@ -579,6 +598,41 @@ export default class PullRequestPanel extends View {
         .children(done.map((x) => this.openResolved.has(x.id) ? this.threadCard(t, pr, x, cx) : this.resolvedRow(t, x, cx))));
   }
 
+  /** The PR's files: change, path, open threads, size, viewed. @param {Record<string, any>} t @param {PullRequest} pr @param {any} cx */
+  files(t, pr, cx) {
+    /** @type {Record<string, any>} */
+    const color = { A: t.ansi2, D: t.ansi1, R: t.ansi4 ?? t.accent, C: t.accent, M: t.ansi3 };
+    /** @type {Map<string, number>} */
+    const open = new Map();
+    for (const x of pr.threads) if (!x.resolved) open.set(x.path, (open.get(x.path) ?? 0) + 1);
+    const viewed = pr.fileList.filter((f) => f.viewed).length;
+    return v_flex()
+      .child(this.heading(t, "FILES", pr.fileList.length ? `${viewed} of ${pr.fileList.length} viewed` : ""))
+      .when(!pr.fileList.length, (el) => el.child(div().py(4).text_size(12).text_color(t.dim).child(pr.threadsError ? `Files unavailable: ${pr.threadsError}` : "Loading files…")))
+      .children(pr.fileList.map((f, i) => {
+        const letter = changeLetter(f.change);
+        const dir = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/") + 1) : "";
+        const n = open.get(f.path) ?? 0;
+        return h_flex().id(`corral-pr-file-${i}`).h(30).px(6).mx(-6).gap(8).items_center().rounded(6).cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click(() => this.openReview(f.path))
+          .child(div().w(12).flex_none().text_size(11.5).font_semibold().text_color(color[letter]).child(letter))
+          .child(h_flex().flex_1().min_w(0).items_center().text_size(12.5).when(f.viewed, (el) => el.text_color(t.dim))
+            .child(div().flex_shrink(1).min_w(0).truncate().text_color(t.dim).child(dir))
+            .child(div().flex_none().child(f.path.slice(dir.length))))
+          .when(n > 0, (el) => el.child(div().flex_none().px(5).rounded(7).bg(alpha(t.blocked, 0.18)).text_size(11).text_color(t.blocked).child(`${n} open`)))
+          .child(div().flex_none().text_size(11).text_color(t.ansi2).child(f.additions ? `+${f.additions}` : ""))
+          .child(div().flex_none().text_size(11).text_color(t.ansi1).child(f.deletions ? `−${f.deletions}` : ""))
+          .child(div().id(`corral-pr-viewed-${i}`).size(15).flex().flex_none().items_center().justify_center().rounded(4).border_1()
+            .border_color(f.viewed ? t.accent : t.input).bg(f.viewed ? t.accent : CLEAR).text_size(10).text_color(t.solid_foreground)
+            .on_mouse_down("left", (/** @type {any} */ _e, /** @type {any} */ cx) => cx.stop_propagation())
+            .on_click((/** @type {any} */ _e, /** @type {any} */ cx) => { cx.stop_propagation(); this.toggleViewed(f.path, cx); })
+            .child(f.viewed ? "✓" : ""));
+      }))
+      .when(pr.fileCount > pr.fileList.length && pr.fileList.length > 0, (el) => el.child(div().pt(8).text_size(12).text_color(t.dim)
+        .child(`Showing ${pr.fileList.length} of ${pr.fileCount} files. The rest are on GitHub.`)));
+  }
+
   /** @param {Record<string, any>} t @param {Thread} x @param {any} cx */
   resolvedRow(t, x, cx) {
     const first = x.comments[0]?.body.split("\n")[0] ?? "";
@@ -596,7 +650,7 @@ export default class PullRequestPanel extends View {
     return v_flex().mb(8).p(10).gap(9).rounded(10).border_1().border_color(t.border).bg(t.surface)
       .child(h_flex().gap(6).items_center()
         .child(div().id(`corral-thread-file-${x.id}`).min_w(0).truncate().font_family("JetBrains Mono").text_size(11.5).text_color(t.accent).cursor_pointer()
-          .on_click(() => this.openThreadFile(x)).child(where))
+          .on_click(() => this.openReview(x.path)).child(where))
         .when(x.outdated, (el) => el.child(div().flex_none().px(5).rounded(4).bg(t.raised).text_size(10.5).text_color(t.dim).child("outdated")))
         .child(div().flex_1())
         .when(x.resolved, (el) => el.child(div().id(`corral-thread-fold-${x.id}`).flex_none().text_size(11.5).text_color(t.dim).cursor_pointer()

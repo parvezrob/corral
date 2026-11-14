@@ -15,10 +15,11 @@ export const THREADS_QUERY = `query($owner: String!, $name: String!, $number: In
   repository(owner: $owner, name: $name) {
     viewerDefaultMergeMethod squashMergeAllowed mergeCommitAllowed rebaseMergeAllowed autoMergeAllowed
     pullRequest(number: $number) {
-      viewerDidAuthor
+      id viewerDidAuthor
+      files(first: 100) { totalCount nodes { path additions deletions changeType viewerViewedState } }
       reviewThreads(first: 100) {
         nodes {
-          id isResolved isOutdated path line originalLine startLine viewerCanResolve viewerCanReply
+          id isResolved isOutdated path line originalLine startLine originalStartLine diffSide viewerCanResolve viewerCanReply
           comments(first: 50) { nodes { id author { login } body createdAt url diffHunk } }
         }
       }
@@ -82,8 +83,17 @@ exit 0`;
  * @property {number | null} line
  * @property {boolean} canResolve
  * @property {boolean} canReply
+ * @property {number | null} startLine  first line of a multi-line comment
+ * @property {"LEFT" | "RIGHT"} side      old or new side of the diff
  * @property {string} hunk
  * @property {ThreadComment[]} comments
+ *
+ * @typedef {object} PrFile
+ * @property {string} path
+ * @property {number} additions
+ * @property {number} deletions
+ * @property {string} change      ADDED | MODIFIED | DELETED | RENAMED | COPIED | CHANGED
+ * @property {boolean} viewed
  *
  * @typedef {"squash" | "merge" | "rebase"} MergeMethod
  *
@@ -115,6 +125,9 @@ exit 0`;
  * @property {boolean} autoMergeAllowed
  * @property {boolean} mine            you opened it
  * @property {string | null} threadsError
+ * @property {string} id                the PR's node id
+ * @property {PrFile[]} fileList        empty until GraphQL answers
+ * @property {number} fileCount
  *
  * @typedef {object} PrState
  * @property {string | null} branch      null: detached HEAD
@@ -248,31 +261,7 @@ export function normalizePr(raw, graph) {
     const who = r.login ?? r.slug ?? r.name;
     if (who && !reviews.some((x) => x.who === who)) reviews.push({ who, state: "requested" });
   }
-  let threads = /** @type {Thread[]} */ ([]);
-  /** @type {MergeMethod[]} */
-  let methods = ["squash", "merge", "rebase"];
-  /** @type {MergeMethod} */
-  let preferred = "squash";
-  let autoMergeAllowed = false;
-  let mine = false;
-  /** @type {string | null} */
-  let threadsError = null;
-  if (graph) {
-    try {
-      const g = JSON.parse(graph);
-      if (g.errors?.length && !g.data) throw new Error(g.errors[0].message);
-      const repo = g.data.repository;
-      const pr = repo.pullRequest;
-      mine = Boolean(pr.viewerDidAuthor);
-      autoMergeAllowed = Boolean(repo.autoMergeAllowed);
-      methods = /** @type {MergeMethod[]} */ ([repo.squashMergeAllowed && "squash", repo.mergeCommitAllowed && "merge", repo.rebaseMergeAllowed && "rebase"].filter(Boolean));
-      const def = String(repo.viewerDefaultMergeMethod ?? "").toLowerCase();
-      preferred = /** @type {MergeMethod} */ (methods.includes(/** @type {MergeMethod} */ (def)) ? def : methods[0] ?? "merge");
-      threads = (pr.reviewThreads?.nodes ?? []).map(normalizeThread);
-    } catch (e) {
-      threadsError = e instanceof Error ? e.message : String(e);
-    }
-  }
+  const g = parseThreadsAnswer(graph);
   return {
     number: raw.number,
     title: raw.title ?? "",
@@ -295,13 +284,56 @@ export function normalizePr(raw, graph) {
     autoMerge: Boolean(raw.autoMergeRequest),
     checks: normalizeChecks(raw.statusCheckRollup ?? []),
     reviews,
-    threads,
-    methods: methods.length ? methods : ["merge"],
-    preferred,
-    autoMergeAllowed,
-    mine,
-    threadsError,
+    threads: g.threads,
+    methods: g.methods.length ? g.methods : ["merge"],
+    preferred: g.preferred,
+    autoMergeAllowed: g.autoMergeAllowed,
+    mine: g.mine,
+    threadsError: g.error,
+    id: g.id,
+    fileList: g.files,
+    fileCount: g.fileCount || raw.changedFiles || 0,
   };
+}
+
+/**
+ * The GraphQL half: threads, files, merge settings. Never throws; `error` says
+ * what went wrong.
+ * @param {string | null} graph
+ */
+export function parseThreadsAnswer(graph) {
+  const out = {
+    threads: /** @type {Thread[]} */ ([]),
+    files: /** @type {PrFile[]} */ ([]),
+    fileCount: 0,
+    id: "",
+    methods: /** @type {MergeMethod[]} */ (["squash", "merge", "rebase"]),
+    preferred: /** @type {MergeMethod} */ ("squash"),
+    autoMergeAllowed: false,
+    mine: false,
+    error: /** @type {string | null} */ (null),
+  };
+  if (!graph) return out;
+  try {
+    const g = JSON.parse(graph);
+    if (g.errors?.length && !g.data) throw new Error(g.errors[0].message);
+    const repo = g.data.repository;
+    const pr = repo.pullRequest;
+    out.id = pr.id ?? "";
+    out.mine = Boolean(pr.viewerDidAuthor);
+    out.autoMergeAllowed = Boolean(repo.autoMergeAllowed);
+    out.methods = /** @type {MergeMethod[]} */ ([repo.squashMergeAllowed && "squash", repo.mergeCommitAllowed && "merge", repo.rebaseMergeAllowed && "rebase"].filter(Boolean));
+    const def = String(repo.viewerDefaultMergeMethod ?? "").toLowerCase();
+    out.preferred = /** @type {MergeMethod} */ (out.methods.includes(/** @type {MergeMethod} */ (def)) ? def : out.methods[0] ?? "merge");
+    out.threads = (pr.reviewThreads?.nodes ?? []).map(normalizeThread);
+    out.files = (pr.files?.nodes ?? []).map((/** @type {any} */ f) => ({
+      path: f.path, additions: f.additions ?? 0, deletions: f.deletions ?? 0, change: f.changeType ?? "MODIFIED", viewed: f.viewerViewedState === "VIEWED",
+    }));
+    out.fileCount = pr.files?.totalCount ?? out.files.length;
+  } catch (e) {
+    out.error = e instanceof Error ? e.message : String(e);
+  }
+  return out;
 }
 
 /** @param {any} t @returns {Thread} */
@@ -315,6 +347,8 @@ export function normalizeThread(t) {
     outdated: Boolean(t.isOutdated),
     path: t.path ?? "",
     line: t.line ?? t.originalLine ?? null,
+    startLine: t.line ? t.startLine ?? null : t.originalStartLine ?? null,
+    side: t.diffSide === "LEFT" ? "LEFT" : "RIGHT",
     canResolve: Boolean(t.viewerCanResolve),
     canReply: Boolean(t.viewerCanReply),
     hunk: t.comments?.nodes?.[0]?.diffHunk ?? "",
@@ -379,6 +413,18 @@ export const GH = {
   create: (p) => ["pr", "create", "--title", p.title, "--body", p.body, "--head", p.head, ...(p.base ? ["--base", p.base] : []), ...(p.draft ? ["--draft"] : [])],
   /** @param {string} run */
   rerunFailed: (run) => ["run", "rerun", run, "--failed"],
+  /**
+   * A review comment on one line (or a range), published at once.
+   * @param {string} host @param {string} repo @param {number} n
+   * @param {{ body: string, sha: string, path: string, line: number, side: "LEFT" | "RIGHT", startLine?: number | null }} c
+   */
+  lineComment: (host, repo, n, c) => ["api", "--hostname", host, "-X", "POST", `repos/${repo}/pulls/${n}/comments`,
+    "-f", `body=${c.body}`, "-f", `commit_id=${c.sha}`, "-f", `path=${c.path}`, "-F", `line=${c.line}`, "-f", `side=${c.side}`,
+    ...(c.startLine && c.startLine < c.line ? ["-F", `start_line=${c.startLine}`, "-f", `start_side=${c.side}`] : [])],
+  /** @param {string} host @param {string} prId @param {string} path @param {boolean} viewed */
+  viewed: (host, prId, path, viewed) => ["api", "graphql", "--hostname", host, "-f", `query=${viewed ? VIEWED_MUTATION : UNVIEWED_MUTATION}`, "-f", `pr=${prId}`, "-f", `path=${path}`],
+  /** The threads/files query on its own (the viewer refreshes with it). @param {string} host @param {string} repo @param {number} n */
+  threads: (host, repo, n) => ["api", "graphql", "--hostname", host, "-f", `query=${THREADS_QUERY}`, "-F", `owner=${repo.split("/")[0]}`, "-F", `name=${repo.split("/")[1]}`, "-F", `number=${n}`],
   /** @param {string} host @param {string} threadId @param {string} body */
   reply: (host, threadId, body) => ["api", "graphql", "--hostname", host, "-f", `query=${REPLY_MUTATION}`, "-f", `thread=${threadId}`, "-f", `body=${body}`],
   /** @param {string} host @param {string} threadId @param {boolean} resolve */
@@ -387,6 +433,8 @@ export const GH = {
 
 const REPLY_MUTATION = "mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }";
 const RESOLVE_MUTATION = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } } }";
+const VIEWED_MUTATION = "mutation($pr: ID!, $path: String!) { markFileAsViewed(input: {pullRequestId: $pr, path: $path}) { clientMutationId } }";
+const UNVIEWED_MUTATION = "mutation($pr: ID!, $path: String!) { unmarkFileAsViewed(input: {pullRequestId: $pr, path: $path}) { clientMutationId } }";
 const UNRESOLVE_MUTATION = "mutation($thread: ID!) { unresolveReviewThread(input: {threadId: $thread}) { thread { isResolved } } }";
 
 /**
