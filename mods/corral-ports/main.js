@@ -8,15 +8,19 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, terminals, layout, shared, setShared, notify } from "herdr";
 import { colors, alpha, CLEAR } from "./lib/theme.js";
 import { sh, openUrl } from "./lib/host.js";
+import { markAlive } from "./lib/engine.js";
 import { panelState } from "./lib/layout.js";
 import { PORT_SCAN, parsePortScan } from "./lib/ports.js";
-import { forwardsFrom, pickLocalPort, planForwards } from "./lib/forward.js";
+import { forwardsFrom, pickLocalPort, planForwards, countMissing } from "./lib/forward.js";
 import { machineTargets, localBusyPorts, startTunnel, stopTunnel, tunnelOutput } from "./lib/tunnels.js";
 
 const SCAN_SHOWN_MS = 2500;    // while the Ports tab is on screen
 const SCAN_HIDDEN_MS = 5000;   // otherwise: still prompt enough for auto-forward
 const AUTO_KEY = "corral.ports.auto";
 const STOPPED_KEY = "corral.ports.stopped";
+const MAX_TRIES = 3;        // automatic starts per server before it waits for Retry
+/** Wait before the next automatic try: 15s, 30s, 60s. @param {number} n tries so far */
+const backoff = (n) => Math.min(300000, 15000 * 2 ** Math.max(0, n - 1));
 
 /** @typedef {import("./lib/ports.js").Port} Port */
 /** @typedef {import("./lib/forward.js").Forward} Forward */
@@ -33,8 +37,15 @@ export default class Ports extends View {
     this.failed = new Map();
     this.scanning = false;
     this.lastScan = 0;
+    /** @type {Map<string, string>} machine -> last raw scan, to skip unchanged ones */
+    this.raw = new Map();
     this.showHidden = false;
     /** @type {Map<string, string | null> | null} */ this.targets = null;
+    /** @type {Map<string, { n: number, at: number }>} "machine:port" -> automatic starts so far */ this.attempts = new Map();
+    /** @type {Map<string, number>} "machine:port" -> scans in a row its server was missing */ this.missing = new Map();
+    /** @type {Set<number>} local ports picked by tunnels still starting */ this.reserved = new Set();
+    /** @type {Map<string, number[]>} local ports that refused a tunnel (busy for someone else) */ this.refused = new Map();
+    /** @type {string | null} */ this.note = null;
     this.input = InputState.new({ placeholder: "Forward a port, e.g. 8080" });
     this.input.on("submit", (/** @type {any} */ _e, /** @type {any} */ cx) => this.addManual(cx));
     cx.timer.every(1000, (/** @type {any} */ cx) => this.tick(cx));
@@ -56,32 +67,47 @@ export default class Ports extends View {
 
   /** @param {any} cx */
   tick(cx) {
+    markAlive("ports");
     const s = panelState(layout());
-    const every = s.open && s.active === "ports" ? SCAN_SHOWN_MS : SCAN_HIDDEN_MS;
-    if (!this.scanning && Date.now() - this.lastScan >= every) this.scan(cx);
+    const shown = s.open && s.active === "ports";
+    const every = shown ? SCAN_SHOWN_MS : SCAN_HIDDEN_MS;
+    if (!this.scanning && Date.now() - this.lastScan >= every) this.scan(cx, shown);
   }
 
-  /** One `ss` per machine, in parallel; then auto-forward acts on the result. @param {any} cx */
-  scan(cx) {
+  /**
+   * One `ss` per machine, in parallel; then auto-forward acts on the result.
+   * Auto-forward only needs remote machines: this computer is scanned only for
+   * the Ports tab. Unchanged output isn't parsed or drawn again.
+   * @param {any} cx @param {boolean} shown
+   */
+  scan(cx, shown = true) {
     this.scanning = true;
     this.lastScan = Date.now();
-    const list = this.machines();
+    const all = this.machines();
+    const list = shown ? all : all.filter((m) => m !== "");
+    let changed = false;
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
         await Promise.all(list.map(async (m) => {
           try {
             const r = await sh(m || null, PORT_SCAN, [], { timeout: 10000 });
+            const raw = `${r.code}\x1f${r.stdout}`;
+            if (this.raw.get(m) === raw && !this.scans.get(m)?.error) return;
+            this.raw.set(m, raw);
+            changed = true;
             if (r.code === 3) this.scans.set(m, { ports: [], error: "Port scanning needs `ss` (Linux)", at: Date.now() });
             else this.scans.set(m, { ports: parsePortScan(r.stdout), error: null, at: Date.now() });
           } catch (e) {
+            changed = true;
+            this.raw.delete(m);
             this.scans.set(m, { ports: this.scans.get(m)?.ports ?? [], error: e instanceof Error ? e.message : String(e), at: Date.now() });
           }
         }));
-        for (const m of [...this.scans.keys()]) if (!list.includes(m)) this.scans.delete(m);
+        for (const m of [...this.scans.keys()]) if (!all.includes(m)) { this.scans.delete(m); this.raw.delete(m); changed = true; }
         await this.autoForward(cx);
       } finally {
         this.scanning = false;
-        cx.notify();
+        if (changed || shown) cx.notify();
       }
     });
   }
@@ -91,21 +117,24 @@ export default class Ports extends View {
     /** @type {Map<string, Port[]>} */
     const listening = new Map();
     for (const [m, s] of this.scans) if (m && !s.error) listening.set(m, s.ports);
+    const forwards = forwardsFrom(terminals());
+    countMissing(this.missing, listening, forwards);
+    const now = Date.now();
+    // Starting, or waiting out a backoff after a failure.
+    const waiting = new Set(this.pending);
+    for (const [key, a] of this.attempts) if (a.n >= MAX_TRIES || now - a.at < backoff(a.n)) waiting.add(key);
     const plan = planForwards({
-      listening,
-      forwards: forwardsFrom(terminals()),
-      stopped: this.stopped,
-      auto: this.auto,
-      pending: new Set([...this.pending, ...this.failed.keys()]),
+      listening, forwards, stopped: this.stopped, auto: this.auto, pending: waiting,
+      machines: new Set(this.machines().filter(Boolean)), missing: this.missing,
     });
-    // A server that went away clears its failure too: a restart gets a fresh try.
-    for (const key of [...this.failed.keys()]) {
+    // A server that has gone away clears its failures: its next start gets fresh tries.
+    for (const key of [...this.attempts.keys()]) {
       const at = key.lastIndexOf(":");
       const ports = listening.get(key.slice(0, at));
-      if (ports && !ports.some((p) => p.port === Number(key.slice(at + 1)))) this.failed.delete(key);
+      if (ports && !ports.some((p) => p.port === Number(key.slice(at + 1)))) { this.attempts.delete(key); this.failed.delete(key); }
     }
     if (plan.forget.length) { const s = this.stopped; for (const k of plan.forget) s.delete(k); this.setStopped(s); }
-    for (const f of plan.stop) await stopTunnel(f.address);
+    for (const f of [...plan.stop, ...plan.remove]) await stopTunnel(f.address);
     for (const { machine, port } of plan.start) await this.forward(machine, port, cx, true);
   }
 
@@ -117,8 +146,11 @@ export default class Ports extends View {
     const key = `${machine}:${port.port}`;
     if (this.pending.has(key)) return;
     this.pending.add(key);
-    this.failed.delete(key);
+    const tries = this.attempts.get(key);
+    this.attempts.set(key, { n: (tries?.n ?? 0) + 1, at: Date.now() });
     cx.notify();
+    /** @type {number | null} */
+    let local = null;
     try {
       if (!this.targets?.has(machine)) this.targets = await machineTargets();
       const target = this.targets.get(machine);
@@ -126,12 +158,16 @@ export default class Ports extends View {
       if (target === null) throw new Error(`${machine} is reached through a custom command; forwarding needs plain ssh`);
       const busy = await localBusyPorts();
       for (const f of forwardsFrom(terminals())) busy.add(f.local);
-      const local = pickLocalPort(port.port, busy);
+      // Ports picked by tunnels still starting, and ones that just failed to bind here.
+      for (const p of this.reserved) busy.add(p);
+      for (const p of this.refused.get(key) ?? []) busy.add(p);
+      local = pickLocalPort(port.port, busy);
       if (local === null) throw new Error(`no free local port near ${port.port}`);
+      this.reserved.add(local);
       const address = await startTunnel({ machine, target, local, remote: port.port, host: port.forwardHost });
-      // ssh fails fast (auth, a port taken meanwhile): look again in a moment.
-      cx.timer.after(2500, (/** @type {any} */ cx) => this.confirm(key, address, local, port, announce, cx));
+      this.check(key, address, local, port, announce, Date.now(), cx);
     } catch (e) {
+      if (local !== null) this.reserved.delete(local);
       this.pending.delete(key);
       this.failed.set(key, e instanceof Error ? e.message : String(e));
       cx.notify();
@@ -139,27 +175,52 @@ export default class Ports extends View {
   }
 
   /**
+   * Ready means the port answers here, not just that ssh runs: it may still be
+   * connecting. Looks every 1.5s, up to 15s.
    * @param {string} key @param {string} address @param {number} local @param {Port} port
-   * @param {boolean} announce @param {any} cx
+   * @param {boolean} announce @param {number} since @param {any} cx
    */
-  confirm(key, address, local, port, announce, cx) {
-    cx.spawn(async (/** @type {any} */ cx) => {
-      const live = forwardsFrom(terminals()).some((f) => f.address === address && f.live);
-      this.pending.delete(key);
-      if (!live) {
-        this.failed.set(key, (await tunnelOutput(address)) || "ssh exited");
+  check(key, address, local, port, announce, since, cx) {
+    cx.timer.after(1500, (/** @type {any} */ cx) => cx.spawn(async (/** @type {any} */ cx) => {
+      const tunnel = forwardsFrom(terminals()).find((f) => f.address === address);
+      // Stopped by hand meanwhile: not a failure.
+      if (!tunnel || this.stopped.has(key)) { this.settle(key, local); cx.notify(); return; }
+      const listening = tunnel.live && (await localBusyPorts()).has(local);
+      if (listening) {
+        this.settle(key, local);
+        this.attempts.delete(key);
+        this.failed.delete(key);
+        this.refused.delete(key);
+        if (announce) this.announce(key, local, port);
+      } else if (tunnel.live && Date.now() - since < 15000) {
+        this.check(key, address, local, port, announce, since, cx);
+        return;
+      } else {
+        const why = (await tunnelOutput(address)) || (tunnel.live ? "ssh didn't open the port in 15s" : "ssh exited");
+        if (/address already in use|cannot listen/i.test(why)) this.refused.set(key, [...(this.refused.get(key) ?? []), local]);
+        this.settle(key, local);
+        this.failed.set(key, why);
         await stopTunnel(address);
-      } else if (announce) {
-        const where = this.where(key.slice(0, key.lastIndexOf(":")), port);
-        notify({
-          title: `${port.app} is ready`,
-          body: `${where ? `${where}, ` : ""}on localhost:${local}${local !== port.port ? ` (${port.port} was busy here)` : ""}. Click to open.`,
-          level: "success",
-          timeout: 8000,
-          action: { name: `corral-status.open-${local}` },
-        });
       }
       cx.notify();
+    }));
+  }
+
+  /** @param {string} key @param {number} local */
+  settle(key, local) {
+    this.pending.delete(key);
+    this.reserved.delete(local);
+  }
+
+  /** @param {string} key @param {number} local @param {Port} port */
+  announce(key, local, port) {
+    const where = this.where(key.slice(0, key.lastIndexOf(":")), port);
+    notify({
+      title: `${port.app} is ready`,
+      body: `${where ? `${where}, ` : ""}on localhost:${local}${local !== port.port ? ` (${port.port} was busy here)` : ""}. Click to open.`,
+      level: "success",
+      timeout: 8000,
+      action: { name: `corral-status.open-${local}` },
     });
   }
 
@@ -173,19 +234,26 @@ export default class Ports extends View {
 
   /** @param {string} machine @param {Port} port @param {any} cx */
   forwardByHand(machine, port, cx) {
+    const key = `${machine}:${port.port}`;
     const s = this.stopped;
-    if (s.delete(`${machine}:${port.port}`)) this.setStopped(s);
+    if (s.delete(key)) this.setStopped(s);
+    this.attempts.delete(key);
+    this.failed.delete(key);
     cx.spawn(async (/** @type {any} */ cx) => { await this.forward(machine, port, cx, false); });
   }
 
   /** @param {any} cx */
   addManual(cx) {
     const n = Number(this.input.value().trim());
+    if (!Number.isInteger(n) || n < 1 || n > 65535) { this.note = "A port is a number from 1 to 65535."; cx.notify(); return; }
     const machine = spaces().find((s) => s.active)?.machine;
-    if (!Number.isInteger(n) || n < 1 || n > 65535 || !machine) return;
+    if (!machine) { this.note = "This space is on this computer: its ports are already here as localhost."; cx.notify(); return; }
     this.input.set_value("");
+    this.note = null;
+    // What the scan knows about it (where it listens), else plain 127.0.0.1.
+    const known = this.scans.get(machine)?.ports.find((p) => p.port === n);
     /** @type {Port} */
-    const port = { port: n, hosts: ["127.0.0.1"], direct: false, forwardHost: "127.0.0.1", terminal: null, pid: null, process: "", cmd: "", app: `Port ${n}`, internal: false };
+    const port = known ?? { port: n, hosts: ["127.0.0.1"], direct: false, forwardHost: "127.0.0.1", terminal: null, pid: null, process: "", cmd: "", app: `Port ${n}`, internal: false };
     this.forwardByHand(machine, port, cx);
   }
 
@@ -219,6 +287,7 @@ export default class Ports extends View {
       .child(v_flex().id("corral-ports-list").flex_1().min_h(0).overflow_y_scrollbar().px(8).pb(8)
         .when(!machines.length, (el) => el.child(div().p(8).text_size(12).text_color(t.dim).child("Looking for servers…")))
         .children(machines.map((m) => this.machineSection(t, cx, m, forwards))))
+      .when(Boolean(this.note), (el) => el.child(div().flex_none().px(12).py(6).border_t(1).border_color(t.border).text_size(11.5).text_color(t.dim).child(this.note ?? "")))
       .child(h_flex().flex_none().px(10).py(8).gap(8).items_center().border_t(1).border_color(t.border)
         .child(div().id("corral-port-input").flex_1().min_w(0).h(30).px(10).flex().items_center().rounded(8).border_1().border_color(t.input).bg(t.chrome)
           .on_mouse_down("left", (/** @type {any} */ _e, /** @type {any} */ cx) => cx.stop_propagation())

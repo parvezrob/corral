@@ -48,12 +48,16 @@ Corral is plain Herdr mods; this is everything it does outside its own folder.
 
 - **Runs commands** (`exec`, on the space's machine): `git`, `gh`, `sh`, `ss`, `rg`/`grep`,
   `find`, `curl`, `codex app-server`, and `ssh -L` for port forwards (as Herdr terminals
-  you can see and stop).
+  you can see and stop). Tunnels use `BatchMode=yes` and `StrictHostKeyChecking=accept-new`:
+  a host seen for the first time is trusted, a changed host key is refused.
 - **Reads files**: the space's folder (Files, viewer), `/proc/<pid>/environ` of listening
   processes to tie a port to its Herdr terminal, and `~/.claude/.credentials.json`
   (or the macOS Keychain item Claude Code uses) for the usage read.
 - **Writes files**: only files you save in the viewer or a suggestion you apply, and
-  CI logs you send to an agent (under `.git/corral/`).
+  CI logs you send to an agent (under `.git/corral/`). Saving a file on another machine
+  goes through a private temp folder here (`mktemp -d`), removed right after.
+- **Layout**: at app start the status bar shows the Ports and PR tabs for a moment if they
+  haven't run yet (Herdr starts a panel tab only once it's shown), then restores the panel.
 - **Network**: GitHub through `gh`; `api.anthropic.com/api/oauth/usage` (read-only, the
   token goes to curl on stdin, it is never refreshed or sent anywhere else); Codex's own
   app server for its limits.

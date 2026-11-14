@@ -7,8 +7,9 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
 import { layout, shared, setShared, notify, nextCommand } from "herdr";
 import { colors, alpha, CLEAR } from "./lib/theme.js";
-import { here } from "./lib/context.js";
+import { here, repoRoot } from "./lib/context.js";
 import { sh, run, openUrl } from "./lib/host.js";
+import { markAlive } from "./lib/engine.js";
 import { panelState } from "./lib/layout.js";
 import { join } from "./lib/paths.js";
 import { openView } from "./lib/open.js";
@@ -25,6 +26,17 @@ const HIDDEN_MS = 60000;    // otherwise: enough for the status bar and toasts
 const CONFIRM_MS = 3000;
 const SUMMARY_KEY = "corral.pr";
 
+/**
+ * `sh -c PUSH_SCRIPT corral <branch>`: pushes the branch where git would, setting
+ * the upstream when there's none or it's another branch (checkout -b x origin/main).
+ */
+const PUSH_SCRIPT = `b=$1
+r=$(git config "branch.$b.pushRemote" || git config remote.pushDefault || { [ "$(git remote | wc -l)" -eq 1 ] && git remote; } || echo origin)
+up=$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null)
+if [ -z "$up" ] || [ "\${up#*/}" != "$b" ]; then exec git push -u "$r" HEAD; fi
+[ "$(git rev-list --count '@{u}..HEAD')" -gt 0 ] && exec git push
+exit 0`;
+
 /** @typedef {import("./lib/pr.js").PullRequest} PullRequest */
 /** @typedef {import("./lib/pr.js").Check} Check */
 /** @typedef {import("./lib/pr.js").Thread} Thread */
@@ -37,6 +49,8 @@ export default class PullRequestPanel extends View {
   /** @param {any} _props @param {any} cx */
   init(_props, cx) {
     /** @type {string | null} */ this.key = null;
+    /** @type {string | null} machine, repo root and branch */ this.ctx = null;
+    /** @type {string} */ this.branch = "";
     /** @type {string | null} */ this.machine = null;
     /** @type {string | null} */ this.root = null;
     /** @type {import("./lib/pr.js").PrState | null} */ this.data = null;
@@ -46,6 +60,7 @@ export default class PullRequestPanel extends View {
     this.loading = false;
     this.again = false;
     this.lastRefresh = 0;
+    /** @type {string | null} the last answer, to skip unchanged ones */ this.lastRaw = null;
     /** @type {"overview" | "threads" | "files"} */ this.tab = "overview";
     /** @type {MergeMethod | null} */ this.method = null;
     /** @type {Record<string, number>} */ this.armed = {};
@@ -87,6 +102,7 @@ export default class PullRequestPanel extends View {
 
   /** @param {any} cx */
   tick(cx) {
+    markAlive("pr");
     this.sync(cx);
     if (!this.root) return;
     const s = panelState(layout());
@@ -96,24 +112,38 @@ export default class PullRequestPanel extends View {
     if (Date.now() - this.lastRefresh >= every) this.refresh(cx);
   }
 
-  /** Follows the shown space, and its branch. @param {any} cx */
+  /** Follows the shown space, its repo and its branch. @param {any} cx */
   sync(cx) {
     const h = here();
-    const key = `${h.key}\x1f${h.space?.branch ?? ""}`;
+    const branch = h.space?.branch ?? "";
+    const key = `${h.key}\x1f${branch}`;
     if (key === this.key) return;
-    const sameRepo = this.key?.split("\x1f")[0] === h.key;
     this.key = key;
-    this.machine = h.machine;
-    if (!sameRepo) { this.root = null; this.data = null; this.error = null; this.note = null; this.prev = null; this.publish(null); }
-    if (!h.cwd) return;
+    if (!h.cwd) { this.reset(h.machine, null, branch); return; }
     cx.spawn(async (/** @type {any} */ cx) => {
-      const r = await sh(h.machine, 'git -C "$1" rev-parse --show-toplevel 2>/dev/null', [h.cwd]).catch(() => /** @type {null} */ (null));
+      const top = await repoRoot(h.machine, h.cwd);
       if (key !== this.key) return;
-      const top = r?.stdout.trim();
-      if (!top) { this.root = null; this.error = "Not a git repository"; cx.notify(); return; }
-      this.root = top;
+      if (!top) { this.reset(h.machine, null, branch); this.error = "Not a git repository"; cx.notify(); return; }
+      // Same repo and branch (another terminal there): nothing changes.
+      if (top === this.root && h.machine === this.machine && branch === this.branch) return;
+      this.reset(h.machine, top, branch);
       this.refresh(cx);
     });
+  }
+
+  /** A different repo or branch: its PR, never the last one's. @param {string | null} machine @param {string | null} root @param {string} branch */
+  reset(machine, root, branch) {
+    this.machine = machine;
+    this.root = root;
+    this.branch = branch;
+    this.ctx = root ? `${machine ?? ""}\0${root}\0${branch}` : null;
+    this.data = null;
+    this.error = null;
+    this.note = null;
+    this.prev = null;
+    this.lastRaw = null;
+    this.armed = {};
+    this.publish(null);
   }
 
   /** @param {any} cx */
@@ -122,14 +152,16 @@ export default class PullRequestPanel extends View {
     if (this.loading) { this.again = true; return; }
     this.loading = true;
     this.lastRefresh = Date.now();
-    const key = this.key, root = this.root;
+    const key = this.ctx, root = this.root;
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
         const r = await sh(this.machine, PR_SCRIPT, [root, THREADS_QUERY], { timeout: 30000 });
-        if (key !== this.key) return;
+        if (key !== this.ctx) return;
         if (r.code === 3) throw new Error("Not a git repository");
         if (r.code === 4) throw new Error(`The GitHub CLI (gh) isn't installed on ${this.machine ?? "this computer"}.`);
         if (r.code !== 0) throw new Error(r.stderr.trim() || "Couldn't read the pull request");
+        if (r.stdout === this.lastRaw && this.data && !this.error) return;
+        this.lastRaw = r.stdout;
         const data = parsePrState(r.stdout);
         this.announce(data.pr);
         this.data = data;
@@ -137,7 +169,7 @@ export default class PullRequestPanel extends View {
         this.fillCreateForm();
         this.publish(data.pr);
       } catch (e) {
-        if (key === this.key) this.error = e instanceof Error ? e.message : String(e);
+        if (key === this.ctx) this.error = e instanceof Error ? e.message : String(e);
       } finally {
         this.loading = false;
         cx.notify();
@@ -170,7 +202,7 @@ export default class PullRequestPanel extends View {
   publish(pr) {
     const s = pr ? summarizeChecks(pr.checks) : null;
     const next = pr && s ? {
-      number: pr.number, state: pr.draft ? "draft" : pr.state, checks: s.overall, failing: s.counts.fail,
+      number: pr.number, state: pr.state !== "open" ? pr.state : pr.draft ? "draft" : "open", checks: s.overall, failing: s.counts.fail,
       threads: pr.threads.filter((t) => !t.resolved).length, ready: canMergeNow(pr) && !blockers(pr).length,
       review: pr.reviewDecision === "REVIEW_REQUIRED" || pr.reviews.some((r) => r.state === "requested"),
     } : null;
@@ -231,9 +263,7 @@ export default class PullRequestPanel extends View {
     const pr = this.pr;
     if (!pr || !this.confirm("merge", cx)) return;
     cx.spawn(async (/** @type {any} */ cx) => {
-      if (await this.gh("Merging…", GH.merge(pr.number, this.chosenMethod(pr), false), cx)) {
-        notify({ title: `PR #${pr.number} merged`, body: pr.title, level: "success" });
-      }
+      await this.gh("Merging…", GH.merge(pr.number, this.chosenMethod(pr), false), cx);
     });
   }
 
@@ -304,9 +334,9 @@ export default class PullRequestPanel extends View {
     cx.notify();
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
-        if (!d.upstream) await run(this.machine, "git", ["push", "-u", "origin", "HEAD"], { cwd: root, timeout: 120000 });
-        else if (d.unpushed > 0) await run(this.machine, "git", ["push"], { cwd: root, timeout: 120000 });
-        const out = await run(this.machine, "gh", GH.create({ title, body: this.body.value(), head: branch, base: d.defaultBranch, draft: this.draft }), { cwd: root, timeout: 60000 });
+        const pushed = await sh(this.machine, PUSH_SCRIPT, [branch], { cwd: root, timeout: 120000 });
+        if (pushed.code !== 0) throw new Error((pushed.stderr || pushed.stdout).trim().split("\n").pop() || "git push failed");
+        const out = await run(this.machine, "gh", GH.create({ title, body: this.body.value(), base: d.defaultBranch, draft: this.draft }), { cwd: root, timeout: 60000 });
         notify({ title: this.draft ? "Draft pull request opened" : "Pull request opened", body: out.trim().split("\n").pop() ?? title, level: "success" });
         this.tab = "overview";
       } catch (e) {
@@ -384,7 +414,7 @@ export default class PullRequestPanel extends View {
     const t = colors();
     const root = v_flex().id("corral-pr").size_full().min_h(0).text_color(t.foreground).text_size(13);
     if (this.error && !this.data) return root.child(this.message(t, this.error, cx));
-    if (!this.data) return root.child(div().p(14).text_size(12).text_color(t.dim).child(this.root || this.key ? "Looking for a pull request…" : "Open a space to see its pull request."));
+    if (!this.data) return root.child(div().p(14).text_size(12).text_color(t.dim).child(this.root || this.ctx ? "Looking for a pull request…" : "Open a space to see its pull request."));
     const pr = this.data.pr;
     if (!pr) return root.child(this.noPr(t, cx));
     const open = pr.threads.filter((x) => !x.resolved).length;
@@ -394,6 +424,8 @@ export default class PullRequestPanel extends View {
         .child(this.subTab(t, "overview", "Overview", cx))
         .child(this.subTab(t, "threads", open ? `Threads · ${open}` : "Threads", cx))
         .child(this.subTab(t, "files", `Files · ${pr.fileCount}`, cx)))
+      .when(Boolean(this.error), (el) => el.child(div().mx(12).mt(8).px(10).py(7).rounded(8).bg(alpha(t.blocked, 0.12)).text_size(12)
+        .child(`Couldn't refresh: ${this.error}. Showing what was last read.`)))
       .when(Boolean(this.note), (el) => el.child(this.noteBar(t, cx)))
       .child(v_flex().id("corral-pr-body").flex_1().min_h(0).overflow_y_scrollbar().px(12).pb(14)
         .child(this.tab === "threads" ? this.threads(t, pr, cx) : this.tab === "files" ? this.files(t, pr, cx) : this.overview(t, pr, cx)));
@@ -563,7 +595,7 @@ export default class PullRequestPanel extends View {
       .when(pr.autoMergeAllowed && !pr.draft && (!ready || pr.autoMerge), (el) => el.child(h_flex().id("corral-pr-auto").gap(8).items_center().cursor_pointer()
         .on_click((/** @type {any} */ _e, /** @type {any} */ cx) => { if (!this.busy) this.toggleAutoMerge(cx); })
         .child(this.toggle(t, pr.autoMerge))
-        .child(div().text_size(12.5).child(pr.autoMerge ? `Merging automatically (${METHOD_LABEL[method].toLowerCase()}) when ready` : "Merge automatically when ready"))));
+        .child(div().text_size(12.5).child(pr.autoMerge ? `Merging automatically (${METHOD_LABEL[pr.autoMergeMethod ?? method].toLowerCase()}) when ready` : "Merge automatically when ready"))));
   }
 
   /** @param {Record<string, any>} t @param {boolean} on */
@@ -685,7 +717,8 @@ export default class PullRequestPanel extends View {
         .child(div().font_medium().child(`You're on ${d.branch}`))
         .child(div().text_color(t.muted).child("Pull requests start from a branch. Switch to one (or have your agent make one) and it shows up here."));
     }
-    const push = !d.upstream ? `Pushes ${d.branch} to origin first.` : d.unpushed > 0 ? `Pushes ${d.unpushed} ${d.unpushed === 1 ? "commit" : "commits"} first.` : "";
+    const tracked = d.upstream && d.upstream.slice(d.upstream.indexOf("/") + 1) === d.branch;
+    const push = !tracked ? `Pushes ${d.branch} first.` : d.unpushed > 0 ? `Pushes ${d.unpushed} ${d.unpushed === 1 ? "commit" : "commits"} first.` : "";
     return v_flex().id("corral-pr-create").flex_1().min_h(0).overflow_y_scrollbar().px(12).pb(14)
       .child(h_flex().pt(14).pb(4).gap(8).items_center()
         .child(div().text_size(13.5).font_medium().child("Open a pull request")))

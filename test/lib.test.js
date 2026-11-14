@@ -19,7 +19,7 @@ test("NUL and section splitting", () => {
 });
 
 test("ssh tunnel arguments", () => {
-  assert.deepEqual(sshArgs({ target: "robin@box", local: 5173, remote: 5173 }).slice(-3), ["-L", "127.0.0.1:5173:127.0.0.1:5173", "robin@box"]);
+  assert.deepEqual(sshArgs({ target: "robin@box", local: 5173, remote: 5173 }).slice(-4), ["-L", "127.0.0.1:5173:127.0.0.1:5173", "--", "robin@box"]);
   assert.ok(sshArgs({ target: "box", local: 3001, remote: 3000, host: "::1" }).includes("127.0.0.1:3001:[::1]:3000"));
   assert.ok(sshArgs({ target: "box", local: 1, remote: 1 }).includes("BatchMode=yes"));
   assert.match(terminalName(65535), /^[a-z0-9_-]{1,32}$/);
@@ -71,11 +71,44 @@ test("auto-forward plan", async () => {
     { address: "t8", machine: "box", remote: 8080, local: 8080, live: true },   // its server is gone
     { address: "t7", machine: "other", remote: 9000, local: 9000, live: true }, // another machine: untouched
   ];
-  const stopped = new Set(["box:6006", "box:4000"]);
-  const plan = planForwards({ listening, forwards, stopped, auto: true, pending: new Set() });
+  const stopped = new Set(["box:6006", "box:4000", "gone:22"]);
+  const machines = new Set(["box", "other"]);
+  // t8's server has been missing for 3 scans; t7's machine "other" wasn't scanned now.
+  const missing = new Map([["box:8080", 3]]);
+  const plan = planForwards({ listening, forwards, stopped, auto: true, pending: new Set(), machines, missing });
   assert.deepEqual(plan.start.map((s) => s.port.port), [5173]);
   assert.deepEqual(plan.stop.map((f) => f.address), ["t8"]);
-  assert.deepEqual(plan.forget, ["box:4000"]);
-  assert.deepEqual(planForwards({ listening, forwards, stopped, auto: false }).start, []);
+  assert.deepEqual(plan.remove, []);
+  assert.deepEqual(plan.forget, ["gone:22"], "a stopped server stays stopped; only gone machines are forgotten");
+  // Missing once (a restart): the tunnel stays.
+  assert.deepEqual(planForwards({ listening, forwards, stopped, auto: true, machines, missing: new Map([["box:8080", 1]]) }).stop, []);
+  // A tunnel whose ssh ended is removed and its server forwarded again.
+  const dead = forwards.map((f) => (f.address === "t9" ? { ...f, live: false } : f));
+  const again = planForwards({ listening, forwards: dead, stopped, auto: true, machines, missing });
+  assert.deepEqual(again.remove.map((f) => f.address), ["t9"]);
+  assert.deepEqual(again.start.map((s) => s.port.port).sort(), [3000, 5173]);
+  // A machine with no spaces left: its tunnels stop.
+  assert.deepEqual(planForwards({ listening, forwards, stopped, auto: true, machines: new Set(["box"]), missing: new Map() }).stop.map((f) => f.address), ["t7"]);
+  assert.deepEqual(planForwards({ listening, forwards, stopped, auto: false, machines }).start, []);
   assert.deepEqual(planForwards({ listening, forwards, stopped, auto: true, pending: new Set(["box:5173"]) }).start, []);
+});
+
+test("ssh targets with a port, and the missing-scan count", async () => {
+  const { sshArgs, splitTarget, countMissing } = await import("../lib/forward.js");
+  assert.deepEqual(splitTarget("robin@robin-pc"), { dest: "robin@robin-pc", port: null });
+  assert.deepEqual(splitTarget("can@10.0.0.7:2222"), { dest: "can@10.0.0.7", port: "2222" });
+  assert.deepEqual(splitTarget("u@[fd7a::1]:2200"), { dest: "u@fd7a::1", port: "2200" });
+  assert.deepEqual(splitTarget("fd7a::1"), { dest: "fd7a::1", port: null });
+  const args = sshArgs({ target: "can@10.0.0.7:2222", local: 3000, remote: 3000 });
+  assert.deepEqual(args.slice(-4), ["-L", "127.0.0.1:3000:127.0.0.1:3000", "--", "can@10.0.0.7"]);
+  assert.ok(args.includes("-p") && args[args.indexOf("-p") + 1] === "2222");
+  assert.ok(args.includes("ConnectTimeout=10"));
+  assert.deepEqual(args.slice(-2), ["--", "can@10.0.0.7"]);
+  const missing = new Map();
+  const fwd = [{ address: "t1", machine: "box", remote: 3000, local: 3000, live: true }];
+  countMissing(missing, new Map([["box", []]]), fwd);
+  countMissing(missing, new Map([["box", []]]), fwd);
+  assert.equal(missing.get("box:3000"), 2);
+  countMissing(missing, new Map([["box", [{ port: 3000 }]]]), fwd);
+  assert.equal(missing.has("box:3000"), false);
 });

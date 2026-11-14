@@ -5,7 +5,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, v_virtual_list, Scrollbar } from "gpui-base";
 import { layout, watchFolder, nextCommand } from "herdr";
 import { colors, CLEAR } from "./lib/theme.js";
-import { here } from "./lib/context.js";
+import { here, repoRoot } from "./lib/context.js";
 import { sh } from "./lib/host.js";
 import { panelState } from "./lib/layout.js";
 import { LIST_SCRIPT, parseListing, visibleRows, changedFolders } from "./lib/tree.js";
@@ -24,6 +24,9 @@ export default class Files extends View {
   /** @param {any} _props @param {any} cx */
   init(_props, cx) {
     /** @type {string | null} */ this.key = null;
+    /** @type {string | null} machine and repo root: changes only when the tree does */ this.ctx = null;
+    /** @type {string} */ this.query = "";
+    this.stale = false;
     /** @type {string | null} */ this.root = null;
     /** @type {string | null} */ this.machine = null;
     this.listing = /** @type {import("./lib/tree.js").Listing | null} */ (null);
@@ -34,6 +37,7 @@ export default class Files extends View {
     /** @type {string | null} */ this.error = null;
     /** @type {string | null} */ this.watching = null;
     this.lastRefresh = 0;
+    /** @type {string | null} the last answer, to skip unchanged ones */ this.lastRaw = null;
     /** @type {import("gpui-kit").Modifiers | null} */ this.pressMods = null;
 
     /** @type {"names" | "contents"} */ this.mode = "names";
@@ -60,14 +64,20 @@ export default class Files extends View {
     });
   }
 
+  async close() {
+    this.input.release();
+  }
+
   /** Called every second: polls a remote folder while the panel shows it, and backs up local watches. @param {any} cx */
   tick(cx) {
-    if (!this.root) return;
-    const s = panelState(layout());
-    if (!s.open || s.active !== "files") return;
-    const now = Date.now();
+    if (!this.root || !this.shown()) return;
     const every = this.machine ? REMOTE_POLL_MS : IDLE_POLL_MS;
-    if (now - this.lastRefresh >= every) this.refresh(cx);
+    if (this.stale || Date.now() - this.lastRefresh >= every) { this.stale = false; this.refresh(cx); }
+  }
+
+  shown() {
+    const s = panelState(layout());
+    return s.open && s.active === "files";
   }
 
   /** Follows the shown space and folder: a new context starts a fresh tree. @param {any} cx */
@@ -75,26 +85,36 @@ export default class Files extends View {
     const h = here();
     if (h.key === this.key) return;
     this.key = h.key;
-    this.machine = h.machine;
-    this.root = null;
+    const key = h.key;
+    if (!h.cwd) { this.reset(h.machine, null); return; }
+    cx.spawn(async (/** @type {any} */ cx) => {
+      // The repo's top when the folder is in one, so the tree and git agree.
+      const root = (await repoRoot(h.machine, h.cwd)) ?? h.cwd;
+      if (key !== this.key) return;
+      // Another terminal in the same repo: keep the tree as it is.
+      if (root === this.root && h.machine === this.machine) return;
+      this.reset(h.machine, root);
+      this.open = this.restoreOpen(root);
+      this.refresh(cx);
+      this.watch(cx);
+      if (this.query.trim()) this.onQuery(this.query, cx);
+    });
+  }
+
+  /** A new folder tree: drop everything about the old one. @param {string | null} machine @param {string | null} root */
+  reset(machine, root) {
+    this.machine = machine;
+    this.root = root;
+    this.ctx = root ? `${machine ?? ""}\0${root}` : null;
     this.listing = null;
     this.rows = [];
     this.allFiles = null;
     this.error = null;
     this.watching = null;
-    if (!h.cwd) return;
-    const key = h.key;
-    cx.spawn(async (/** @type {any} */ cx) => {
-      // The repo's top when the folder is in one, so the tree and git agree.
-      const r = await sh(h.machine, 'git -C "$1" rev-parse --show-toplevel 2>/dev/null || printf "%s\\n" "$1"', [h.cwd]).catch(() => /** @type {null} */ (null));
-      if (key !== this.key) return;
-      /** @type {string} */
-      const root = r?.stdout.trim() || h.cwd;
-      this.root = root;
-      this.open = this.restoreOpen(this.root);
-      this.refresh(cx);
-      this.watch(cx);
-    });
+    this.lastRaw = null;
+    this.stale = false;
+    this.nameHits = [];
+    this.contentHits = [];
   }
 
   /** @param {string} root */
@@ -110,13 +130,16 @@ export default class Files extends View {
   /** Local roots get a real folder watch; remote ones are polled by tick(). @param {any} cx */
   watch(cx) {
     if (this.machine || !this.root || this.watching === this.root) return;
-    const root = this.root, key = this.key;
+    const root = this.root, key = this.ctx;
     this.watching = root;
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
-        while (this.key === key && this.watching === root) {
+        while (this.ctx === key && this.watching === root) {
           await watchFolder(root);
-          if (this.key === key) { this.allFiles = null; this.refresh(cx); }
+          if (this.ctx !== key) break;
+          this.allFiles = null;
+          // Hidden: just remember; the tick refreshes when the tab is on screen.
+          if (this.shown()) this.refresh(cx); else this.stale = true;
         }
       } catch {
         if (this.watching === root) this.watching = null; // too big to watch: tick() polls instead
@@ -130,19 +153,24 @@ export default class Files extends View {
     if (this.loading) { this.again = true; return; }
     this.loading = true;
     this.lastRefresh = Date.now();
-    const key = this.key, root = this.root;
+    const key = this.ctx, root = this.root;
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
-        const r = await sh(this.machine, LIST_SCRIPT, [root, "", ...this.open], { timeout: 20000 });
-        if (key !== this.key) return;
+        const args = [root, "", ...this.open];
+        const r = await sh(this.machine, LIST_SCRIPT, args, { timeout: 20000 });
+        if (key !== this.ctx) return;
         if (r.code !== 0 && !r.stdout) throw new Error(r.stderr.trim() || `Cannot list ${root}`);
+        // Same folders asked, same answer: nothing to rebuild or draw.
+        const raw = `${args.join("\0")}\x1f${r.stdout}`;
+        if (raw === this.lastRaw && this.listing && !this.error) return;
+        this.lastRaw = raw;
         this.listing = parseListing(r.stdout);
         // Forget open folders that are gone.
         for (const f of [...this.open]) if (!this.listing.folders.has(f)) this.open.delete(f);
         this.rebuild();
         this.error = null;
       } catch (e) {
-        if (key === this.key) this.error = e instanceof Error ? e.message : String(e);
+        if (key === this.ctx) this.error = e instanceof Error ? e.message : String(e);
       } finally {
         this.loading = false;
         cx.notify();
@@ -184,12 +212,13 @@ export default class Files extends View {
     if (this.allFiles) { this.nameHits = rank(text, this.allFiles); cx.notify(); return; }
     if (this.searching || !this.root) return;
     this.searching = true;
-    const key = this.key, root = this.root;
+    const key = this.ctx, root = this.root;
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
         const r = await sh(this.machine, FILES_SCRIPT, [root], { timeout: 20000 });
-        if (key !== this.key) return;
-        this.allFiles = splitNul(r.stdout);
+        if (key !== this.ctx) return;
+        // find(1) prints "./a/b"; git prints "a/b".
+        this.allFiles = splitNul(r.stdout).map((p) => (p.startsWith("./") ? p.slice(2) : p));
         this.nameHits = rank(this.query, this.allFiles);
       } catch (e) {
         this.error = e instanceof Error ? e.message : String(e);
@@ -205,11 +234,11 @@ export default class Files extends View {
     const q = this.query.trim();
     if (!q || !this.root || this.searching) return;
     this.searching = true;
-    const key = this.key, root = this.root;
+    const key = this.ctx, root = this.root;
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
         const r = await sh(this.machine, CONTENT_SCRIPT, [root, q], { timeout: 30000 });
-        if (key === this.key) this.contentHits = parseContentHits(r.stdout);
+        if (key === this.ctx) this.contentHits = parseContentHits(r.stdout);
       } catch (e) {
         this.error = e instanceof Error ? e.message : String(e);
       } finally {

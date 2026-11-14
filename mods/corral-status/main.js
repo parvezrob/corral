@@ -8,6 +8,7 @@ import { forwardsFrom } from "./lib/forward.js";
 import { openPanel } from "./lib/panel.js";
 import { openUrl, sh } from "./lib/host.js";
 import { here } from "./lib/context.js";
+import { newBoot, asleep, wake } from "./lib/engine.js";
 import { USAGE_SCRIPT, USER_AGENT, parseUsage, chipText, worst, level, shownProviders, popoverHeight } from "./lib/usage.js";
 
 const POPOVER_WIDTH = 360;
@@ -55,6 +56,9 @@ export default class Status extends View {
     /** @type {string | null} */ this.popover = null;
     cx.timer.every(15000, (/** @type {any} */ cx) => this.usageTick(cx, false));
     this.usageTick(cx, false);
+    // Engines that didn't start with the app (their tab not shown) get woken once.
+    const boot = newBoot();
+    cx.timer.after(3000, (/** @type {any} */ cx) => wake(asleep(boot), cx));
     cx.spawn(async (/** @type {any} */ cx) => {
       for (;;) {
         const command = await nextCommand();

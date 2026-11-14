@@ -2,10 +2,10 @@
 // unstaged, untracked and conflicted files with stage/unstage/discard, a commit
 // box, pull/push, and recent commits. A file opens its diff in the viewer pane.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { v_flex, h_flex, TextareaState, Textarea } from "gpui-base";
 import { layout, watchFolder, shared, setShared, notify, nextCommand } from "herdr";
 import { colors, alpha, CLEAR } from "./lib/theme.js";
-import { here } from "./lib/context.js";
+import { here, repoRoot } from "./lib/context.js";
 import { sh, run } from "./lib/host.js";
 import { panelState } from "./lib/layout.js";
 import { CHANGES_SCRIPT, parseChanges, ACTIONS } from "./lib/changes.js";
@@ -14,7 +14,9 @@ import { openView } from "./lib/open.js";
 
 const REMOTE_POLL_MS = 3000;
 const IDLE_POLL_MS = 15000;
-const CONFIRM_MS = 3000;   // a destructive button arms on the first click, acts on the second
+const HIDDEN_POLL_MS = 30000;   // panel closed: the Changes count, at most this often
+const CONFIRM_MS = 3000;
+const GROUP_ROWS = 300;     // rows per group before "Show all": an untracked build folder can be thousands   // a destructive button arms on the first click, acts on the second
 
 /** @typedef {import("./lib/changes.js").ChangedFile} ChangedFile */
 /** @typedef {"staged" | "unstaged" | "untracked" | "conflicts"} Group */
@@ -23,6 +25,8 @@ export default class Changes extends View {
   /** @param {any} _props @param {any} cx */
   init(_props, cx) {
     /** @type {string | null} */ this.key = null;
+    /** @type {string | null} machine and repo root */ this.ctx = null;
+    this.stale = false;
     /** @type {string | null} */ this.root = null;
     /** @type {string | null} */ this.machine = null;
     /** @type {import("./lib/changes.js").Changes | null} */ this.data = null;
@@ -32,12 +36,16 @@ export default class Changes extends View {
     this.again = false;
     this.busy = /** @type {string | null} */ (null);   // what's running: "commit", "push", ...
     this.lastRefresh = 0;
+    /** @type {string | null} the last answer, to skip unchanged ones */ this.lastRaw = null;
     /** @type {string | null} */ this.watching = null;
     /** @type {Record<string, number>} */ this.armed = {};
-    /** @type {Set<string>} */ this.folded = new Set(["commits"]);
+    /** @type {Set<string>} */ this.folded = new Set();
+    /** @type {Set<string>} groups showing every row */ this.expanded = new Set();
     /** @type {{ group: Group, path: string } | null} */ this.selected = null;
     this.message = "";
-    this.input = InputState.new({ placeholder: "Commit message" });
+    // A summary line, and a body below it if you want one.
+    this.input = TextareaState.new({ placeholder: "Commit message" });
+    this.input.set_auto_grow(1, 6);
     this.input.on("change", (/** @type {any} */ _e, /** @type {any} */ cx) => {
       const had = Boolean(this.message.trim());
       this.message = this.input.value();
@@ -64,12 +72,26 @@ export default class Changes extends View {
     });
   }
 
+  async close() {
+    this.input.release();
+  }
+
   /** @param {any} cx */
   tick(cx) {
     if (!this.root) return;
+    const since = Date.now() - this.lastRefresh;
+    if (this.shown()) {
+      if (this.stale || since >= (this.machine ? REMOTE_POLL_MS : IDLE_POLL_MS)) { this.stale = false; this.refresh(cx); }
+    } else if (since >= HIDDEN_POLL_MS && (this.stale || this.machine)) {
+      // Hidden: only the tab's count needs keeping up, and not often.
+      this.stale = false;
+      this.refresh(cx);
+    }
+  }
+
+  shown() {
     const s = panelState(layout());
-    if (!s.open || s.active !== "changes") return;
-    if (Date.now() - this.lastRefresh >= (this.machine ? REMOTE_POLL_MS : IDLE_POLL_MS)) this.refresh(cx);
+    return s.open && s.active === "changes";
   }
 
   /** @param {any} cx */
@@ -77,36 +99,44 @@ export default class Changes extends View {
     const h = here();
     if (h.key === this.key) return;
     this.key = h.key;
-    this.machine = h.machine;
-    this.root = null;
-    this.data = null;
-    this.error = null;
-    this.note = null;
-    this.selected = null;
-    this.watching = null;
-    if (!h.cwd) return;
     const key = h.key;
+    if (!h.cwd) { this.reset(h.machine, null); return; }
     cx.spawn(async (/** @type {any} */ cx) => {
-      const r = await sh(h.machine, 'git -C "$1" rev-parse --show-toplevel 2>/dev/null', [h.cwd]).catch(() => /** @type {null} */ (null));
+      const top = await repoRoot(h.machine, h.cwd);
       if (key !== this.key) return;
-      const top = r?.stdout.trim();
+      if (top && top === this.root && h.machine === this.machine) return;   // same repo
+      this.reset(h.machine, top);
       if (!top) { this.error = "Not a git repository"; this.publishCount(0); cx.notify(); return; }
-      this.root = top;
       this.refresh(cx);
       this.watch(cx);
     });
   }
 
+  /** @param {string | null} machine @param {string | null} root */
+  reset(machine, root) {
+    this.machine = machine;
+    this.root = root;
+    this.ctx = root ? `${machine ?? ""}\0${root}` : null;
+    this.data = null;
+    this.error = null;
+    this.note = null;
+    this.selected = null;
+    this.watching = null;
+    this.lastRaw = null;
+    this.stale = false;
+  }
+
   /** @param {any} cx */
   watch(cx) {
     if (this.machine || !this.root || this.watching === this.root) return;
-    const root = this.root, key = this.key;
+    const root = this.root, key = this.ctx;
     this.watching = root;
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
-        while (this.key === key && this.watching === root) {
+        while (this.ctx === key && this.watching === root) {
           await watchFolder(root);
-          if (this.key === key) this.refresh(cx);
+          if (this.ctx !== key) break;
+          if (this.shown()) this.refresh(cx); else this.stale = true;
         }
       } catch {
         if (this.watching === root) this.watching = null;
@@ -120,18 +150,20 @@ export default class Changes extends View {
     if (this.loading) { this.again = true; return; }
     this.loading = true;
     this.lastRefresh = Date.now();
-    const key = this.key, root = this.root;
+    const key = this.ctx, root = this.root;
     cx.spawn(async (/** @type {any} */ cx) => {
       try {
         const r = await sh(this.machine, CHANGES_SCRIPT, [root], { timeout: 20000 });
-        if (key !== this.key) return;
+        if (key !== this.ctx) return;
         if (r.code === 3) { this.error = "Not a git repository"; this.data = null; return; }
         if (r.code !== 0) throw new Error(r.stderr.trim() || "git status failed");
+        if (r.stdout === this.lastRaw && this.data && !this.error) return;
+        this.lastRaw = r.stdout;
         this.data = parseChanges(r.stdout);
         this.error = null;
         this.publishCount(this.data.count);
       } catch (e) {
-        if (key === this.key) this.error = e instanceof Error ? e.message : String(e);
+        if (key === this.ctx) this.error = e instanceof Error ? e.message : String(e);
       } finally {
         this.loading = false;
         cx.notify();
@@ -154,7 +186,7 @@ export default class Changes extends View {
     if (!this.root || this.busy) return Promise.resolve(false);
     this.busy = label;
     this.note = null;
-    const key = this.key, root = this.root, machine = this.machine;
+    const key = this.ctx, root = this.root, machine = this.machine;
     cx.notify();
     return new Promise((resolve) => {
       cx.spawn(async (/** @type {any} */ cx) => {
@@ -163,7 +195,7 @@ export default class Changes extends View {
           await run(machine, "git", args, { cwd: root, timeout });
           ok = true;
         } catch (e) {
-          if (key === this.key) this.note = `${label} failed: ${e instanceof Error ? e.message : String(e)}`;
+          if (key === this.ctx) this.note = `${label} failed: ${e instanceof Error ? e.message : String(e)}`;
         } finally {
           this.busy = null;
           this.refresh(cx);
@@ -178,10 +210,14 @@ export default class Changes extends View {
   async commit(cx) {
     const message = this.message.trim();
     const d = this.data;
+    const key = this.ctx;
     if (!message || !d || this.busy) return;
     // Nothing staged: commit everything, like most git panels.
     if (!d.staged.length && !(await this.git("Stage all", ACTIONS.stageAll(), cx))) return;
-    if (await this.git("Commit", ACTIONS.commit(message), cx)) {
+    // Another space was shown meanwhile: don't commit there.
+    if (key !== this.ctx) return;
+    // Hooks (lint, tests) can take a while.
+    if (await this.git("Commit", ACTIONS.commit(message), cx, 180000)) {
       this.message = "";
       this.input.set_value("");
       cx.notify();
@@ -215,7 +251,7 @@ export default class Changes extends View {
     const path = join(this.root, f.path);
     const newTab = Boolean(e?.modifiers?.platform || e?.modifiers?.control);
     if (group === "conflicts") { openView({ path, machine: this.machine, root: this.root, mode: "file" }, { newTab }); return; }
-    openView({ path, machine: this.machine, root: this.root, mode: "diff", diff: group === "untracked" ? "untracked" : group }, { newTab });
+    openView({ path, machine: this.machine, root: this.root, mode: "diff", diff: group === "untracked" ? "untracked" : group, orig: f.orig }, { newTab });
   }
 
   /** @param {any} cx */
@@ -228,7 +264,7 @@ export default class Changes extends View {
       .when(Boolean(this.note), (el) => el.child(div().px(12).py(6).text_size(12).text_color(t.ansi1).bg(alpha(t.ansi1, 0.08)).child(this.note ?? "")))
       .child(this.commitBox(t, cx))
       .child(!d
-        ? div().p(12).text_size(12).text_color(t.dim).child(this.error ?? (this.loading || this.key ? "Loading changes…" : "No folder"))
+        ? div().p(12).text_size(12).text_color(t.dim).child(this.error ?? (this.loading || this.ctx ? "Loading changes…" : "No folder"))
         : v_flex().id("corral-git-list").flex_1().min_h(0).overflow_y_scrollbar().px(6).pb(8)
           .when(d.count === 0, (el) => el.child(div().px(8).py(10).text_size(12).text_color(t.dim).child("No changes. The working tree is clean.")))
           .child(this.group(t, cx, "conflicts", "Conflicts", d.conflicts))
@@ -263,10 +299,10 @@ export default class Changes extends View {
     const d = this.data;
     const ready = Boolean(this.message.trim() && d && d.count > 0 && !this.busy);
     const label = !d ? "Commit" : d.staged.length ? `Commit ${d.staged.length} staged` : d.count ? `Commit all ${d.count}` : "Nothing to commit";
-    return h_flex().flex_none().px(10).py(8).gap(8).items_center()
-      .child(div().id("corral-commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(t.input).bg(t.chrome)
+    return h_flex().flex_none().px(10).py(8).gap(8).items_start()
+      .child(div().id("corral-commit-message").flex_1().min_w(0).min_h(32).px(4).py(1).rounded(8).border_1().border_color(t.input).bg(t.chrome)
         .on_mouse_down("left", (/** @type {any} */ _e, /** @type {any} */ cx) => cx.stop_propagation())
-        .child(Input.new(this.input).h_full().w_full().text_size(12.5)))
+        .child(Textarea.new(this.input).w_full().text_size(12.5)))
       .child(div().id("corral-commit").h(32).px(12).flex().items_center().rounded(8).text_size(12).flex_none()
         .bg(ready ? t.accent : t.raised).text_color(ready ? t.accent_foreground : t.dim)
         .when(ready, (el) => el.cursor_pointer()).on_click(() => { if (ready) this.commit(cx); })
@@ -291,7 +327,9 @@ export default class Changes extends View {
         .child(div().flex_1().child(`${title.toUpperCase()} · ${files.length}`))
         .when(Boolean(bulk), (el) => el.child(div().id(`corral-bulk-${group}`).px(6).py(2).rounded(5).font_normal().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
           .on_click((/** @type {any} */ _e, /** @type {any} */ cx) => { cx.stop_propagation(); bulk?.act(); }).child(bulk?.label ?? ""))))
-      .when(!folded, (el) => el.children(files.map((f) => this.row(t, cx, group, f))));
+      .when(!folded, (el) => el.children((this.expanded.has(group) ? files : files.slice(0, GROUP_ROWS)).map((f) => this.row(t, cx, group, f))))
+      .when(!folded && files.length > GROUP_ROWS && !this.expanded.has(group), (el) => el.child(div().id(`corral-more-${group}`).px(8).py(6).text_size(12).text_color(t.accent).cursor_pointer()
+        .on_click(() => { this.expanded.add(group); cx.notify(); }).child(`Show all ${files.length}`)));
   }
 
   /** @param {Record<string, any>} t @param {any} cx @param {Group} group @param {ChangedFile} f */
@@ -322,7 +360,7 @@ export default class Changes extends View {
       .when(group === "unstaged" || group === "untracked", (el) => el
         .child(action("discard", "undo", group === "untracked" ? "Delete file" : "Discard changes", discard))
         .child(action("stage", "plus", "Stage", () => this.git("Stage", ACTIONS.stage([f.path]), cx))))
-      .when(group === "staged", (el) => el.child(action("unstage", "minus", "Unstage", () => this.git("Unstage", ACTIONS.unstage([f.path]), cx))))
+      .when(group === "staged", (el) => el.child(action("unstage", "minus", "Unstage", () => this.git("Unstage", ACTIONS.unstage([f.path], !this.data?.branch.oid), cx))))
       .when(group === "conflicts", (el) => el.child(action("stage", "plus", "Mark resolved", () => this.git("Stage", ACTIONS.stage([f.path]), cx))));
   }
 

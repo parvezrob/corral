@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CHANGES_SCRIPT, parseChanges, shortWhen, ACTIONS } from "../lib/changes.js";
@@ -58,7 +58,34 @@ test("relative times shorten", () => {
   assert.equal(shortWhen("in the future"), "in the future");
 });
 
-test("actions keep paths after --", () => {
-  assert.deepEqual(ACTIONS.stage(["-rf"]), ["add", "--", "-rf"]);
-  assert.deepEqual(ACTIONS.discard(["a b.txt"]), ["restore", "--worktree", "--", "a b.txt"]);
+test("actions keep paths after --, and literal", () => {
+  assert.deepEqual(ACTIONS.stage(["-rf"]), ["--literal-pathspecs", "add", "--", "-rf"]);
+  assert.deepEqual(ACTIONS.discard(["a b.txt"]), ["--literal-pathspecs", "restore", "--worktree", "--", "a b.txt"]);
+  assert.deepEqual(ACTIONS.unstage(["x"], true), ["--literal-pathspecs", "rm", "--cached", "-q", "--", "x"]);
+});
+
+test("discarding app/[id] leaves app/i alone; unstage works before the first commit", (t) => {
+  try { execFileSync("git", ["--version"]); } catch { t.skip("git not installed"); return; }
+  const dir = mkdtempSync(join(tmpdir(), "corral-literal-"));
+  const git = (...args) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", ...args], { encoding: "utf8" });
+  try {
+    git("init", "-q", "-b", "main");
+    writeFileSync(join(dir, "first.txt"), "x\n");
+    git("add", "first.txt");
+    git(...ACTIONS.unstage(["first.txt"], true));
+    assert.equal(git("status", "--porcelain").trim(), "?? first.txt");
+    mkdirSync(join(dir, "app", "[id]"), { recursive: true });
+    mkdirSync(join(dir, "app", "i"), { recursive: true });
+    writeFileSync(join(dir, "app", "[id]", "page.tsx"), "one\n");
+    writeFileSync(join(dir, "app", "i", "page.tsx"), "two\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
+    writeFileSync(join(dir, "app", "[id]", "page.tsx"), "one changed\n");
+    writeFileSync(join(dir, "app", "i", "page.tsx"), "two changed\n");
+    git(...ACTIONS.discard(["app/[id]/page.tsx"]));
+    assert.equal(readFileSync(join(dir, "app", "[id]", "page.tsx"), "utf8"), "one\n");
+    assert.equal(readFileSync(join(dir, "app", "i", "page.tsx"), "utf8"), "two changed\n", "the other file keeps its edits");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

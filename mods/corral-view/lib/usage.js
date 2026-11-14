@@ -12,12 +12,14 @@ export const USER_AGENT = "corral-herdr-mod/0.1 (usage read)";
  * Claude: "<plan>\x1f<body>\n<http code>", or "!nologin" / "!expired" / "!nocurl".
  * Codex: the JSON-RPC reply line, or "!missing" / "!noreply".
  */
-export const USAGE_SCRIPT = `claude() {
+export const USAGE_SCRIPT = `claude_usage() {
   f="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
   creds=
   if [ -r "$f" ]; then creds=$(tr -d '\\n' < "$f")
   elif command -v security >/dev/null 2>&1; then creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
   fi
+  # Only Claude's own login: the same file holds MCP servers' tokens too.
+  creds=$(printf '%s' "$creds" | sed -n 's/.*"claudeAiOauth" *: *{\\([^}]*\\)}.*/\\1/p')
   tok=$(printf '%s' "$creds" | sed -n 's/.*"accessToken" *: *"\\([^"]*\\)".*/\\1/p')
   [ -n "$tok" ] || { printf '!nologin'; return; }
   exp=$(printf '%s' "$creds" | sed -n 's/.*"expiresAt" *: *\\([0-9]*\\).*/\\1/p')
@@ -28,12 +30,16 @@ export const USAGE_SCRIPT = `claude() {
   printf 'Authorization: Bearer %s\\n' "$tok" | curl -sS --max-time 15 -H @- -H 'anthropic-beta: oauth-2025-04-20' -A "$1" \\
     -w '\\n%{http_code}' https://api.anthropic.com/api/oauth/usage 2>&1
 }
-codex() {
+codex_usage() {
   command -v codex >/dev/null 2>&1 || { printf '!missing'; return; }
   d=$(mktemp -d) || return
   mkfifo "$d/in" "$d/out" || { rm -rf "$d"; return; }
-  timeout 15 codex app-server < "$d/in" > "$d/out" 2>/dev/null &
-  pid=$!
+  trap '' PIPE
+  # macOS has no timeout(1): use gtimeout, else a watchdog.
+  t=; command -v timeout >/dev/null 2>&1 && t=timeout; [ -z "$t" ] && command -v gtimeout >/dev/null 2>&1 && t=gtimeout
+  if [ -n "$t" ]; then "$t" 15 codex app-server < "$d/in" > "$d/out" 2>/dev/null & pid=$!; dog=
+  else command codex app-server < "$d/in" > "$d/out" 2>/dev/null & pid=$!; ( sleep 15; kill "$pid" ) >/dev/null 2>&1 & dog=$!
+  fi
   exec 3>"$d/in" 4<"$d/out"
   printf '%s\\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"corral","title":"Corral for Herdr","version":"0.1.0"}}}' \\
     '{"jsonrpc":"2.0","method":"initialized"}' '{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read"}' >&3
@@ -43,12 +49,13 @@ codex() {
   done
   exec 3>&- 4<&-
   kill "$pid" 2>/dev/null
+  [ -n "$dog" ] && kill "$dog" 2>/dev/null
   rm -rf "$d"
   [ -n "$found" ] || printf '!noreply'
 }
-claude "$1"
+claude_usage "$1"
 printf '\\036'
-codex`;
+codex_usage`;
 
 /**
  * @typedef {object} Limit
@@ -105,6 +112,8 @@ export function parseClaude(part) {
   const code = nl < 0 ? "" : rest.slice(nl + 1).trim();
   p.plan = planName(plan);
   if (code === "401") { p.error = "Claude's login has expired. It renews the next time Claude Code runs here."; return p; }
+  if (code === "000") { const why = body.split("\n")[0].replace(/^curl: \(\d+\) /, ""); p.error = `Couldn't reach Claude's usage service${why ? `: ${why}` : " (offline?)"}.`; return p; }
+  if (code === "429") { p.error = "Claude's usage service is busy. Trying again shortly."; return p; }
   if (code !== "200") { p.error = code ? `Claude's usage service answered ${code}.` : body.split("\n")[0] || "No answer from Claude."; return p; }
   /** @type {any} */
   let d;

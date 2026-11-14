@@ -6,7 +6,7 @@
 #   ./install.sh            link, then switch this window to the corral layout
 #   ./install.sh --remove   remove the links (switch layouts first)
 set -eu
-here=$(cd "$(dirname "$0")" && pwd)
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 home=${HERDR_APP_HOME:-$HOME/.config/herdr-app}
 if [ ! -d "$home" ]; then
   echo "No Herdr app home at $home. Open Herdr once, or set HERDR_APP_HOME (herdr-app --help shows it)." >&2

@@ -149,7 +149,7 @@ test("steps, blockers and mergeability", () => {
 test("gh argv", () => {
   assert.deepEqual(GH.merge(14, "squash", false), ["pr", "merge", "14", "--squash"]);
   assert.deepEqual(GH.merge(14, "rebase", true), ["pr", "merge", "14", "--rebase", "--auto"]);
-  assert.deepEqual(GH.create({ title: "T", body: "", head: "feat", base: "main", draft: true }), ["pr", "create", "--title", "T", "--body", "", "--head", "feat", "--base", "main", "--draft"]);
+  assert.deepEqual(GH.create({ title: "T", body: "", base: "main", draft: true }), ["pr", "create", "--title", "T", "--body", "", "--base", "main", "--draft"]);
   const reply = GH.reply("github.com", "T1", "@mkoval thanks");
   assert.equal(reply.at(-1), "body=@mkoval thanks");
   assert.ok(reply.includes("--hostname"));
@@ -213,7 +213,7 @@ test("agents: the shown tab first, then the space, most recent wins", () => {
 });
 
 test("thread prompt quotes every comment", () => {
-  const p = threadPrompt(14, { id: "T", resolved: false, outdated: false, path: "lib/git.js", line: 42, canResolve: true, canReply: true, hunk: "", comments: [{ id: "c", who: "mkoval", body: "Fix it.", at: "", url: "" }] });
+  const p = threadPrompt(14, { id: "T", resolved: false, outdated: false, path: "lib/git.js", line: 42, canResolve: true, canReply: true, startLine: null, side: "RIGHT", comments: [{ id: "c", who: "mkoval", body: "Fix it.", at: "", url: "" }] });
   assert.match(p, /PR #14 at lib\/git\.js:42/);
   assert.match(p, /mkoval:\nFix it\./);
 });

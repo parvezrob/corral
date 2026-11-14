@@ -13,8 +13,8 @@ import { GH, parseThreadsAnswer, threadPrompt, ago } from "./lib/pr.js";
 import { handOff, sendLabel } from "./lib/handoff.js";
 import { join } from "./lib/paths.js";
 
-/** Rows drawn with threads between them. Past this, the rest is on GitHub. */
-const MAX_ROWS = 1500;
+/** Rows drawn at first, and added by each "Show more". Rows aren't virtual (threads sit between them). */
+const PAGE_ROWS = 500;
 const ROW = 20;
 
 /** @typedef {import("./lib/open.js").ViewRequest} ViewRequest */
@@ -50,7 +50,7 @@ export class Review {
     /** @type {number | null} */ this.composeAt = null;
     /** @type {string | null} */ this.busy = null;
     /** @type {string | null} */ this.note = null;
-    this.cut = false;
+    this.limit = PAGE_ROWS;
   }
 
   release() {
@@ -84,7 +84,6 @@ export class Review {
     /** @type {DiffRow[]} */
     const note = [{ kind: "note", old: null, new: null, text: section === null ? "GitHub didn't send a diff for this file (too large, or binary)." : "No line changes (a rename or mode change)." }];
     this.rows = rows.length ? rows : note;
-    this.cut = this.rows.length > MAX_ROWS;
     this.localBranch = b.stdout.trim() || null;
     this.useThreads(g, r.file);
   }
@@ -94,10 +93,15 @@ export class Review {
     const g = parseThreadsAnswer(answer);
     this.threads = g.threads.filter((t) => t.path === file);
     this.viewed = g.files.find((f) => f.path === file)?.viewed ?? false;
-    const placed = placeThreads(this.rows.slice(0, MAX_ROWS), this.threads);
+    if (g.error) this.note = `Threads unavailable: ${g.error}`;
+    this.place();
+  }
+
+  /** Threads onto the rows on screen; the rest list at the top. */
+  place() {
+    const placed = placeThreads(this.rows.slice(0, this.limit), this.threads);
     this.at = placed.at;
     this.elsewhere = placed.elsewhere;
-    if (g.error) this.note = `Threads unavailable: ${g.error}`;
   }
 
   /**
@@ -113,7 +117,8 @@ export class Review {
     try {
       await run(req.machine, "gh", args, { cwd: req.root ?? undefined, timeout: 60000 });
       const g = await run(req.machine, "gh", GH.threads(r.host, r.repo, r.number), { cwd: req.root ?? undefined, timeout: 30000 });
-      this.useThreads(g, r.file);
+      // Moved to another file meanwhile: these threads aren't its threads.
+      if (this.req === req) this.useThreads(g, r.file);
       command("corral-pr.refresh");
       return true;
     } catch (e) {
@@ -145,7 +150,7 @@ export class Review {
     if (!r.id) return;
     const next = /** @type {boolean} */ (!this.viewed);
     this.viewed = next;
-    cx.spawn(async (/** @type {any} */ cx) => { if (!(await this.act(req, "Saving…", GH.viewed(r.host, r.id, r.file, next), cx))) this.viewed = !next; });
+    cx.spawn(async (/** @type {any} */ cx) => { if (!(await this.act(req, "Saving…", GH.viewed(r.host, r.id, r.file, next), cx)) && this.req === req) this.viewed = !next; });
   }
 
   /** A comment on the line a row shows. @param {ViewRequest} req @param {number} index @param {any} cx */
@@ -183,7 +188,7 @@ export class Review {
   /** Writes the suggested lines into the working copy, if it still has what the reviewer saw. @param {ViewRequest} req @param {Thread} t @param {string} suggestion @param {any} cx */
   apply(req, t, suggestion, cx) {
     const r = /** @type {ReviewTarget} */ (req.review);
-    const why = this.canApply(req, t);
+    const why = this.req !== req ? "Open the file again to apply this." : this.canApply(req, t);
     if (why) { this.note = why; cx.notify(); return; }
     const end = /** @type {number} */ (t.line);
     const start = t.startLine ?? end;
@@ -212,8 +217,9 @@ export class Review {
    * @param {Record<string, any>} t @param {any} cx @param {ViewRequest} req
    * @param {(file: string) => void} go  open another file of the PR
    * @param {string} mono
+   * @param {() => void} edit  open the working copy of this file
    */
-  header(t, cx, req, go, mono) {
+  header(t, cx, req, go, mono, edit) {
     const r = /** @type {ReviewTarget} */ (req.review);
     const i = r.files.indexOf(r.file);
     const dir = r.file.includes("/") ? r.file.slice(0, r.file.lastIndexOf("/") + 1) : "";
@@ -239,6 +245,7 @@ export class Review {
             .border_color(this.viewed ? t.accent : t.input).bg(this.viewed ? t.accent : CLEAR).text_size(10).text_color(t.solid_foreground)
             .child(this.viewed ? "✓" : ""))
           .child("Viewed")))
+        .child(this.button(t, "corral-review-edit", "Edit file", () => edit()))
         .child(this.button(t, "corral-review-web", "GitHub", () => openUrl(`${r.url}/files`))));
   }
 
@@ -258,7 +265,7 @@ export class Review {
 
   /** @param {Record<string, any>} t @param {any} cx @param {ViewRequest} req @param {string} mono @param {string} ui */
   body(t, cx, req, mono, ui) {
-    const rows = this.rows.slice(0, MAX_ROWS);
+    const rows = this.rows.slice(0, this.limit);
     const addBg = alpha(t.ansi2, 0.12), delBg = alpha(t.ansi1, 0.12);
     /** A line number; clicking it opens a comment box under the line. @param {number | null} n @param {number} i @param {string} side */
     const num = (n, i, side) => div().id(`corral-ln-${side}-${i}`).w(40).flex_none().text_right().pr(6).text_color(t.dim)
@@ -294,8 +301,10 @@ export class Review {
         if (this.composeAt === i) out.push(this.composer(t, cx, req, i, ui));
         return out;
       }))
-      .when(this.cut, (el) => el.child(div().px(12).py(10).font_family(ui).text_size(12).text_color(t.dim)
-        .child(`Showing the first ${MAX_ROWS.toLocaleString("en")} lines. The rest is on GitHub.`)));
+      .when(this.rows.length > this.limit, (el) => el.child(div().id("corral-review-more").mx(12).my(10).px(10).py(6).self_start().rounded(7)
+        .border_1().border_color(t.input).font_family(ui).text_size(12).cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_click((/** @type {any} */ _e, /** @type {any} */ cx) => { this.limit += PAGE_ROWS; this.place(); cx.notify(); })
+        .child(`Show more (${this.rows.length - this.limit} lines left)`)));
   }
 
   /** @param {Record<string, any>} t @param {string} who */

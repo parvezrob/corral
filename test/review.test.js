@@ -34,7 +34,7 @@ const DIFF = [
 ].join("\n");
 
 /** @returns {import("../lib/pr.js").Thread} */
-const thread = (o) => ({ id: "T", resolved: false, outdated: false, path: "lib/git.js", line: 11, startLine: null, side: "RIGHT", canResolve: true, canReply: true, hunk: "", comments: [], ...o });
+const thread = (o) => ({ id: "T", resolved: false, outdated: false, path: "lib/git.js", line: 11, startLine: null, side: "RIGHT", canResolve: true, canReply: true, comments: [], ...o });
 
 test("one file out of a PR diff: changed, renamed, deleted, bare patch", () => {
   assert.match(fileSection(DIFF, "lib/git.js") ?? "", /joinRename/);

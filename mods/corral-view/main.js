@@ -3,7 +3,7 @@
 // retargeted through shared state.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView, v_virtual_list, Scrollbar } from "gpui-base";
-import { props, shared, setShared, settings, nextCommand, notify } from "herdr";
+import { props, shared, setShared, settings, nextCommand, notify, panes, focused, run as command } from "herdr";
 import { colors, alpha, CLEAR } from "./lib/theme.js";
 import { readFile, writeFile, run, sh, openUrl, StaleFileError } from "./lib/host.js";
 import { JOB_LOG_SCRIPT, SAVE_LOG_SCRIPT, parseJobLog, GH, failurePrompt } from "./lib/pr.js";
@@ -14,7 +14,7 @@ import { splitMarkdown } from "./lib/markdown.js";
 import { parseDiff, addedFileRows, widestRow } from "./lib/diff.js";
 import { READ_ONLY } from "./lib/git.js";
 import { basename, dirname, join, relative } from "./lib/paths.js";
-import { requestKey } from "./lib/open.js";
+import { requestKey, claimTab } from "./lib/open.js";
 
 const ROW = 20;          // diff row height, px
 const CODE_LINE = 19;    // editor line height at 12.5 px, for sizing code blocks
@@ -36,6 +36,7 @@ export default class Viewer extends View {
     this.reset();
     this.handle = cx.focus_handle();
     if (p?.path) this.load(p, cx);
+    if (this.viewId) claimTab(this.viewId);
     cx.spawn(async (/** @type {any} */ cx) => {
       for (;;) {
         const command = await nextCommand();
@@ -88,7 +89,14 @@ export default class Viewer extends View {
 
   /** @param {ViewRequest} req @param {any} cx */
   load(req, cx) {
-    if (this.dirty && req.path !== this.req?.path) { this.waiting = req; this.seq = req.seq ?? Date.now(); cx.notify(); return; }
+    if (this.dirty) {
+      // The very file and view being edited: nothing to do, keep editing.
+      const same = req.path === this.req?.path && req.mode === this.req?.mode && req.mode === "file";
+      this.seq = req.seq ?? Date.now();
+      if (!same) this.waiting = req;
+      cx.notify();
+      return;
+    }
     const keepView = this.req?.path === req.path && this.req?.mode === req.mode ? this.view : null;
     this.reset();
     this.req = req;
@@ -160,7 +168,8 @@ export default class Viewer extends View {
     } else {
       const which = req.diff === "staged" ? ["--cached"] : req.diff === "head" ? ["HEAD"] : [];
       const rel = req.root ? relative(req.root, req.path) ?? req.path : req.path;
-      const out = await run(req.machine, "git", [...READ_ONLY, "diff", ...which, "--no-color", "--no-ext-diff", "-M", "--", rel], { cwd: req.root ?? dirname(req.path) });
+      const paths = req.orig ? [req.orig, rel] : [rel];
+      const out = await run(req.machine, "git", [...READ_ONLY, "--literal-pathspecs", "diff", ...which, "--no-color", "--no-ext-diff", "-M", "--", ...paths], { cwd: req.root ?? dirname(req.path) });
       rows = parseDiff(out);
       if (!rows.length) rows = [{ kind: "note", old: null, new: null, text: "No changes" }];
     }
@@ -229,19 +238,23 @@ export default class Viewer extends View {
     const req = this.req;
     if (!req || !this.source || this.saving || (!this.dirty && !overwrite)) return;
     const text = this.source.value();
+    const source = this.source;
     this.saving = true;
-    const seq = this.seq;
     cx.spawn(async (/** @type {any} */ cx) => {
+      // Judged by the editor it was saved from: another file's request arriving
+      // meanwhile doesn't cancel this save's result.
+      const current = () => this.source === source;
       try {
         const expected = overwrite ? await readFile(req.machine, req.path) : this.original;
         await writeFile(req.machine, req.path, text, expected);
-        if (seq !== this.seq) return;
+        if (!current()) return;
         this.original = text;
-        this.dirty = false;
+        // Typing during a remote save: that part is still unsaved.
+        this.dirty = source.value() !== text;
         this.conflict = false;
         if (this.blocks.length || isMarkdown(req.path)) this.makeBlocks(text);
       } catch (e) {
-        if (seq !== this.seq) return;
+        if (!current()) return;
         if (e instanceof StaleFileError) this.conflict = true;
         else notify({ title: `Couldn't save ${basename(req.path)}`, body: e instanceof Error ? e.message : String(e), level: "error" });
       } finally {
@@ -268,9 +281,11 @@ export default class Viewer extends View {
     const req = this.req;
     if (!req) return;
     if (/^[a-z][a-z0-9+.-]*:/i.test(url) && !url.startsWith("file:")) { openUrl(url); return; }
-    const target = url.replace(/^file:\/\//, "").replace(/#.*$/, "");
-    if (!target) return;
-    const path = target.startsWith("/") ? target : join(dirname(req.path), decodeURIComponent(target));
+    const raw = url.replace(/^file:\/\//, "").replace(/#.*$/, "");
+    if (!raw) return;
+    let target = raw;
+    try { target = decodeURIComponent(raw); } catch { /* a literal % in the name */ }
+    const path = target.startsWith("/") ? target : join(dirname(req.path), target);
     this.load({ ...req, path, mode: "file", seq: Date.now() }, cx);
   }
 
@@ -305,7 +320,8 @@ export default class Viewer extends View {
     if (req?.mode === "log") return this.logHeader(t, cx);
     if (req?.mode === "prdiff" && req.review) {
       const r = req.review, base = req;
-      return this.review.header(t, cx, req, (file) => this.load({ ...base, path: join(base.root ?? "", file), review: { ...r, file }, seq: Date.now() }, cx), MONO());
+      return this.review.header(t, cx, req, (file) => this.load({ ...base, path: join(base.root ?? "", file), review: { ...r, file }, seq: Date.now() }, cx), MONO(),
+        () => this.load({ path: base.path, machine: base.machine, root: base.root, mode: "file", seq: Date.now() }, cx));
     }
     const shown = req ? (req.root && relative(req.root, req.path)) || req.path : "";
     const dir = shown.includes("/") ? shown.slice(0, shown.lastIndexOf("/") + 1) : "";
@@ -318,6 +334,11 @@ export default class Viewer extends View {
       .child(h_flex().flex_1().min_w(0).items_center().font_family(MONO()).text_size(12)
         .child(div().flex_shrink(1).min_w(0).truncate().text_color(t.dim).child(dir))
         .child(div().flex_none().text_color(t.foreground).child(shown.slice(dir.length)))
+        .when(req?.mode === "diff" && this.view === "diff", (el) => {
+          const add = this.rows.filter((r) => r.kind === "add").length, del = this.rows.filter((r) => r.kind === "del").length;
+          return el.when(add > 0, (e) => e.child(div().ml(8).flex_none().text_color(t.ansi2).child(`+${add}`)))
+            .when(del > 0, (e) => e.child(div().ml(add > 0 ? 4 : 8).flex_none().text_color(t.ansi1).child(`−${del}`)));
+        })
         .when(req?.mode === "diff", (el) => el.child(div().ml(8).flex_none().font_family(/** @type {string} */ (settings().ui_font_family) || "Geist").text_color(t.muted).child(req?.diff === "staged" ? "staged changes" : req?.diff === "untracked" ? "new file" : "changes"))))
       .when(this.dirty, (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.saving ? "Saving…" : "● Unsaved")))
       .when(md, (el) => el.child(h_flex().p(2).gap(2).rounded(8).border_1().border_color(t.border).bg(t.chrome).text_size(12)
@@ -326,7 +347,24 @@ export default class Viewer extends View {
       .when(req?.mode === "diff" && req?.diff !== "staged", (el) => el.child(div().id("corral-edit").h(26).px(10).flex().items_center().rounded(7).border_1().border_color(t.input).cursor_pointer().text_size(12)
         .hover((s) => s.bg(t.hover)).on_click(() => this.toggleView(cx)).child("Edit file")))
       .when(this.dirty, (el) => el.child(div().id("corral-save").h(26).px(12).flex().items_center().rounded(7).bg(t.solid).text_color(t.solid_foreground).cursor_pointer().text_size(12)
-        .on_click(() => this.save(cx)).child("Save")));
+        .on_click(() => this.save(cx)).child("Save")))
+      .child(this.zoomButton(t));
+  }
+
+  /** This tab's viewer pane: one per tab, and a click here is in the shown tab. */
+  ownPane() {
+    const tab = focused()?.tab;
+    return panes().find((p) => p.mod === "corral-view" && p.tab === tab) ?? null;
+  }
+
+  /** Full width for a long diff or file, and back. @param {Record<string, any>} t */
+  zoomButton(t) {
+    const p = this.ownPane();
+    const zoomed = Boolean(p?.zoomed);
+    return div().id("corral-zoom").size(26).flex_none().flex().items_center().justify_center().rounded(7).cursor_pointer().text_color(t.muted)
+      .hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(zoomed ? "Back beside the terminal" : "Zoom")
+      .on_click(() => { const own = this.ownPane(); if (own) command("pane.zoom", { pane: own.pane }); })
+      .child(svg(`mods/corral-view/${zoomed ? "minimize" : "maximize"}.svg`).size(13));
   }
 
   /** @param {Record<string, any>} t @param {any} cx */

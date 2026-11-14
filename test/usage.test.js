@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { USAGE_SCRIPT, USER_AGENT, parseUsage, parseClaude, parseCodex, pace, until, chipText, level, worst } from "../lib/usage.js";
@@ -46,7 +46,7 @@ test("Claude: older answers without limits[], and every failure in words", () =>
   assert.match(parseClaude("!expired").error ?? "", /expired/);
   assert.match(parseClaude("max\x1f{}\n401").error ?? "", /expired/);
   assert.match(parseClaude("max\x1fbusy\n529").error ?? "", /529/);
-  assert.match(parseClaude("max\x1fcurl: (6) Could not resolve host\n000").error ?? "", /000/);
+  assert.match(parseClaude("max\x1fcurl: (6) Could not resolve host\n000").error ?? "", /reach.*resolve host/);
 });
 
 test("Codex: windows, credits, free resets", () => {
@@ -135,4 +135,45 @@ test("popover height follows what it shows", async () => {
   const missing = parseCodex("!missing");
   assert.deepEqual(shownProviders({ claude, codex: missing }).map((p) => p.id), ["claude"]);
   assert.equal(popoverHeight(null, false), 126);
+});
+
+test("Claude's own token, not an MCP server's stored after it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "corral-usage-"));
+  try {
+    const bin = join(dir, "bin");
+    mkdirSync(join(dir, ".claude"), { recursive: true });
+    mkdirSync(bin);
+    const future = Date.now() + 3600e3;
+    writeFileSync(join(dir, ".claude", ".credentials.json"), JSON.stringify({
+      claudeAiOauth: { accessToken: "CLAUDE_TOK", expiresAt: future, subscriptionType: "max", scopes: ["user:inference"] },
+      mcpOAuth: { "srv|1": { accessToken: "MCP_TOK", expiresAt: 1000 } },
+    }));
+    writeFileSync(join(bin, "curl"), `#!/bin/sh\ncat > "${join(dir, "stdin")}"\nprintf '{"limits":[]}\\n200'\n`);
+    chmodSync(join(bin, "curl"), 0o755);
+    const out = execFileSync("sh", ["-c", USAGE_SCRIPT, "corral", USER_AGENT], { encoding: "utf8", env: { ...process.env, HOME: dir, PATH: `${bin}:/usr/bin:/bin`, CLAUDE_CONFIG_DIR: "" } });
+    assert.equal(readFileSync(join(dir, "stdin"), "utf8"), "Authorization: Bearer CLAUDE_TOK\n");
+    assert.equal(parseUsage(out).claude.plan, "Max");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex answers on a machine without timeout(1), like macOS", () => {
+  const dir = mkdtempSync(join(tmpdir(), "corral-usage-"));
+  try {
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    for (const tool of ["sh", "mktemp", "mkfifo", "rm", "sleep", "sed", "tr", "date", "cat"]) {
+      const real = execFileSync("sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).trim();
+      symlinkSync(real, join(bin, tool));
+    }
+    writeFileSync(join(bin, "codex"), `#!/bin/sh\nwhile IFS= read -r line; do case $line in *'"id":2'*) printf '%s\\n' '${JSON.stringify(CODEX)}' ;; esac; done\n`);
+    chmodSync(join(bin, "codex"), 0o755);
+    const started = Date.now();
+    const out = execFileSync(join(bin, "sh"), ["-c", USAGE_SCRIPT, "corral", USER_AGENT], { encoding: "utf8", env: { HOME: dir, PATH: bin } });
+    assert.equal(parseUsage(out).codex.error, null);
+    assert.ok(Date.now() - started < 5000, "doesn't wait for the watchdog");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

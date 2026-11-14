@@ -51,7 +51,10 @@ yours; nothing here changes your repos unless the step says so.
 - [ ] Stop it, then start the server again: it isn't re-forwarded (you stopped it). Forward brings it back.
 - [ ] Something already on 8765 on the Mac: the tunnel takes the next port and says so.
 - [ ] Turn auto-forward off: new servers show under "Not forwarded" with a Forward button.
-- [ ] Ctrl-C the server: its tunnel goes away by itself.
+- [ ] Ctrl-C the server: its tunnel goes away by itself (after a few seconds: a restart in between keeps it).
+- [ ] Quit and reopen the app with the panel closed or on Files: within ~3 s the panel flicks to
+      Ports and PR and back (that starts their background work), and servers forward without opening Ports.
+- [ ] Sleep the Mac with a tunnel up, wake it: the tunnel comes back by itself.
 
 ## 5. Usage
 
@@ -63,11 +66,15 @@ yours; nothing here changes your repos unless the step says so.
 
 ## 6. Status bar and panel
 
+- [ ] The viewer's ⤢ button zooms it to full width and back.
+- [ ] Commit message box grows up to 6 lines. Check which key adds a line and which commits
+      (Enter / Shift-Enter / Cmd-Enter); the Commit button always works.
+
 - [ ] Machine name, branch, PR chip (`PR #n · …`) and agents are right for the shown space.
 - [ ] Switching spaces (local ↔ robin-pc) updates every tab and the status bar.
 
 ## Known gaps
 
 - Reviews post comments one by one; there's no pending "Start a review" batch yet.
-- Very large PR files show their first 1,500 lines; the rest is a GitHub link.
+- Very large PR files show 500 lines at a time ("Show more"); review threads past the first 100 aren't shown.
 - Ports needs `ss` (Linux) on the machine running the servers.

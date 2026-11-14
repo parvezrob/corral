@@ -19,6 +19,7 @@ const VIEWS_KEY = "corral.views";
  * @property {string | null} root     the repo or folder it belongs to (for git and short paths)
  * @property {"file" | "diff" | "log" | "prdiff"} mode
  * @property {"staged" | "unstaged" | "untracked" | "head"} [diff]  which change a diff shows
+ * @property {string | null} [orig]   a rename's old path (relative to root), so the diff pairs them
  * @property {number} [seq]           newer requests win
  * @property {{ number: number, host: string, repo: string, id: string, head: string, headSha: string, url: string, file: string, files: string[] }} [review]  a PR file (mode "prdiff"), `file` relative to the repo
  * @property {{ host: string, repo: string, job: string, run: string, check: string, pr: number }} [log]  a CI job (mode "log"); `path` is its URL
@@ -64,4 +65,17 @@ export function openView(request, options = {}) {
   next[tab] = viewId;
   setShared(VIEWS_KEY, next);
   run("pane.split", { direction: "right", pane: anchor?.pane, mod: VIEW_MOD, props: { ...request, viewId, seq } });
+}
+
+/**
+ * Records that this tab's viewer is `viewId`, unless the tab already has one.
+ * A viewer opened in a tab of its own calls this when it starts.
+ * @param {string} viewId
+ */
+export function claimTab(viewId) {
+  const tab = focused()?.tab;
+  if (!tab) return;
+  const views = /** @type {Record<string, string>} */ (shared(VIEWS_KEY) ?? {});
+  if (views[tab]) return;
+  setShared(VIEWS_KEY, { ...views, [tab]: viewId });
 }

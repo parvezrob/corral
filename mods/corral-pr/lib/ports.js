@@ -15,11 +15,19 @@ export const PORT_SCAN = String.raw`command -v ss >/dev/null 2>&1 || exit 3
 out=$(ss -ltnpH 2>/dev/null)
 printf '%s\n' "$out"
 printf '\036\n'
-printf '%s\n' "$out" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -un | while read -r pid; do
-  t=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^HC_TERMINAL_ID=//p' | head -n 1)
-  c=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)
-  printf '%s\t%s\t%s\n' "$pid" "$t" "$c"
-done`;
+files=
+for pid in $(printf '%s\n' "$out" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -un); do
+  [ -r "/proc/$pid/environ" ] && files="$files /proc/$pid/environ"
+  [ -r "/proc/$pid/cmdline" ] && files="$files /proc/$pid/cmdline"
+done
+[ -n "$files" ] || exit 0
+# One awk for every process: its Herdr terminal and its command line.
+awk 'BEGIN { RS = "\0" }
+  FNR == 1 { split(FILENAME, f, "/"); pid = f[3]; kind = f[4]; seen[pid] = 1 }
+  kind == "environ" && /^HC_TERMINAL_ID=/ { term[pid] = substr($0, 16) }
+  kind == "cmdline" && length(cmd[pid]) < 300 { cmd[pid] = (cmd[pid] == "" ? $0 : cmd[pid] " " $0) }
+  END { for (p in seen) printf "%s\t%s\t%s\n", p, term[p], substr(cmd[p], 1, 300) }' $files 2>/dev/null
+exit 0`;
 
 /** Programs whose own sockets are internals (an agent's local API), never dev servers. */
 const AGENT_PROCESSES = new Set(["claude", "codex", "gemini", "opencode", "cursor-agent", "amp", "droid", "copilot", "kiro", "pi", "grok", "qwen", "herdr", "hc", "herdr-core"]);
